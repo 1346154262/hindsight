@@ -16,6 +16,7 @@ import atexit
 import dataclasses
 import os
 import signal
+import socket
 import sys
 import warnings
 
@@ -132,6 +133,28 @@ def resolve_daemon_host_port(
     # Only force localhost if the user didn't explicitly set a host
     host = args_host if (explicit_host or configured_host) else "127.0.0.1"
     return ResolvedDaemonHostPort(host=host, port=port)
+
+
+def _port_bind_error(host: str, port: int) -> OSError | None:
+    """Return the error uvicorn's bind would raise for host:port, or None if it would succeed.
+
+    uvicorn only binds after the app's startup has run — embedded PostgreSQL, model loading,
+    migrations — so an occupied port otherwise costs a full initialization before failing, which
+    a supervisor with Restart=always turns into a restart storm (#4281).
+
+    This mirrors uvicorn's own TCP bind (Config.bind_socket: address family from the host string,
+    SO_REUSEADDR) so it can only fail where uvicorn would, and it never calls listen(): nothing can
+    connect to the probe, and the socket is released before uvicorn binds for real. A listener
+    appearing between the two is not caught here; uvicorn then fails exactly as it did before.
+    """
+    family = socket.AF_INET6 if host and ":" in host else socket.AF_INET
+    with socket.socket(family=family) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((host, port))
+        except OSError as exc:
+            return exc
+    return None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -275,6 +298,14 @@ def main():
         args.host = resolved_daemon_host_port.host
         args.port = resolved_daemon_host_port.port
 
+    # Fail before any expensive initialization if the port cannot be bound. For --daemon this
+    # runs in the foreground parent too, so the error reaches the terminal instead of the log.
+    bind_error = _port_bind_error(args.host, args.port)
+    if bind_error is not None:
+        print(f"Error: cannot bind {args.host}:{args.port}: {bind_error}", file=sys.stderr)
+        sys.exit(1)
+
+    if is_daemon:
         # Detach into background (parent re-execs and exits; child redirects
         # stdio to log file).  No lockfile needed — port binding prevents
         # duplicate daemons.
