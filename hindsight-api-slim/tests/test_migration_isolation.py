@@ -1,16 +1,13 @@
 """HINDSIGHT_API_MIGRATION_ISOLATION decides where migrations run.
 
-Alembic drives PostgreSQL through SQLAlchemy's sync engine, i.e. psycopg2, which has
-no free-threaded build: importing it on a free-threaded interpreter re-enables the GIL
-for the life of the process. A server that migrates on startup would spend the rest of
-its life single-threaded, having done the damage before serving a request. "auto"
-therefore isolates exactly there, and "true"/"false" let a deployment decide.
+Alembic drives PostgreSQL through SQLAlchemy's sync engine, i.e. psycopg2. "true"
+keeps that import graph and its thread pool out of a long-lived server process by
+running the migration in a child; "false", the default, runs it in-process.
 """
 
 import io
 import json
 import os
-import sysconfig
 from unittest.mock import patch
 
 import pytest
@@ -36,12 +33,6 @@ def test_false_does_not_isolate(monkeypatch):
     assert _isolates("false", monkeypatch) is False
 
 
-def test_auto_follows_the_interpreter(monkeypatch):
-    """auto isolates only where psycopg2 would cost the process its free-threading."""
-    free_threaded = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
-    assert _isolates("auto", monkeypatch) is free_threaded
-
-
 def test_child_never_recurses(monkeypatch):
     """The subprocess must run the migration, not spawn another one."""
     monkeypatch.setenv(migrations._CHILD_MARKER, "1")
@@ -50,21 +41,21 @@ def test_child_never_recurses(monkeypatch):
         assert migrations._should_isolate_migrations() is False
 
 
-@pytest.mark.parametrize("bad", ["", "yes", "no", "1", "0", "always", "never", "subprocess"])
+@pytest.mark.parametrize("bad", ["", "yes", "no", "1", "0", "auto", "always", "never", "subprocess"])
 def test_rejects_unknown_values(monkeypatch, bad):
     """Silently defaulting would run migrations in the wrong process, invisibly.
 
     "1"/"0"/"yes"/"no" are rejected on purpose: the flag is not a general bool parser,
-    and the three spellings it does take are the ones documented.
+    and the two spellings it does take are the ones documented.
     """
     monkeypatch.setenv("HINDSIGHT_API_MIGRATION_ISOLATION", bad)
     with pytest.raises(ValueError, match="HINDSIGHT_API_MIGRATION_ISOLATION"):
         _parse_migration_isolation()
 
 
-def test_defaults_to_auto(monkeypatch):
+def test_defaults_to_in_process(monkeypatch):
     monkeypatch.delenv("HINDSIGHT_API_MIGRATION_ISOLATION", raising=False)
-    assert _parse_migration_isolation() == "auto"
+    assert _parse_migration_isolation() == "false"
 
 
 def test_case_and_whitespace_are_tolerated(monkeypatch):
@@ -113,3 +104,34 @@ def test_main_rejects_an_unknown_target(monkeypatch):
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"target": "drop_everything", "kwargs": {}})))
     with pytest.raises(SystemExit, match="drop_everything"):
         migrations._main()
+
+
+async def test_extension_context_run_migration_goes_through_the_isolation_boundary():
+    """Runtime tenant provisioning must not open a sync engine in the server process.
+
+    ``ExtensionContext.run_migration`` is the seam cloud tenant provisioning uses to
+    create a schema for a new bank. It used to call ``run_migrations`` and then the
+    ``ensure_*`` helpers one by one -- and only the first of those isolates, so the
+    other three opened a sync engine in the API process regardless of the flag.
+    ``run_migrations_for_schemas`` is the entrypoint that covers all four behind one
+    isolation check.
+    """
+    from hindsight_api.extensions.context import DefaultExtensionContext
+
+    ctx = DefaultExtensionContext(database_url="postgresql://user:pass@host/db")
+    with (
+        patch.object(migrations, "run_migrations_for_schemas") as sweep,
+        patch.object(migrations, "run_migrations") as run_one,
+        patch.object(migrations, "ensure_embedding_dimension") as dim,
+        patch.object(migrations, "ensure_vector_extension") as vec,
+        patch.object(migrations, "ensure_text_search_extension") as text_search,
+    ):
+        await ctx.run_migration("tenant_acme")
+
+    for unisolated in (run_one, dim, vec, text_search):
+        unisolated.assert_not_called()
+    (url, schemas), kwargs = sweep.call_args
+    assert url == "postgresql://user:pass@host/db"
+    assert schemas == ["tenant_acme"]
+    # The post-migration extension steps must still happen -- inside the child.
+    assert kwargs["vector_extension"] and kwargs["text_search_extension"]

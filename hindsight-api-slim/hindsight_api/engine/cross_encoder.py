@@ -13,7 +13,7 @@ from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-import httpx
+import aiohttp
 
 from .._cross_loop import CrossLoopSemaphore
 from ..config import (
@@ -37,6 +37,7 @@ from ..config import (
     DEFAULT_ZEROENTROPY_BASE_URL,
     RerankerMemberConfig,
 )
+from .aiohttp_session import LoopLocal, LoopLocalSession, UpstreamHTTPError, per_phase_timeout, raise_for_status
 from .bank_attribution import reranker_bank_attribution_headers
 from .local_device import (
     align_local_model_weights,
@@ -45,6 +46,7 @@ from .local_device import (
     resolve_model_device_type,
     select_local_device,
 )
+from .remote_retry import RetryPolicy, acall_with_retry
 from .tei_retry import TEI_KEEPALIVE_EXPIRY_SECONDS, is_retryable_tei_transport_error, tei_retry_delay
 
 logger = logging.getLogger(__name__)
@@ -82,10 +84,19 @@ class CrossEncoderModel(ABC):
         """
         pass
 
-    @abstractmethod
+    # Bounded retry for this member's remote calls, or None to call straight through.
+    # Set by create_cross_encoder for the remote providers; the in-process backends,
+    # the rrf passthrough, TEI (own retry loop) and MultiCrossEncoder (its members
+    # retry individually) leave it None. Living on the base class rather than in each
+    # provider is deliberate: retry then applies to the one method every backend has
+    # to implement, so a new remote reranker inherits it instead of having to
+    # remember — the omission that let a single Cohere 429 fail an entire recall
+    # (#4134).
+    retry_policy: RetryPolicy | None = None
+
     async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
         """
-        Score query-document pairs for relevance.
+        Score query-document pairs for relevance, retrying transient failures.
 
         Args:
             pairs: List of (query, document) tuples to score
@@ -93,7 +104,30 @@ class CrossEncoderModel(ABC):
         Returns:
             List of relevance scores (higher = more relevant)
         """
-        pass
+        if self.retry_policy is None:
+            return await self._predict(pairs)
+        # One budget per predict(): rerank is one logical call on the synchronous
+        # recall path, so the worst-case added latency has to stay bounded.
+        return await acall_with_retry(
+            lambda: self._predict(pairs),
+            policy=self.retry_policy,
+            budget=self.retry_policy.new_budget(),
+            provider=self.provider_name,
+        )
+
+    async def _predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+        """Score ``pairs`` without retry — what each backend in this module implements.
+
+        Deliberately not ``@abstractmethod``: ``CrossEncoderModel`` is exported from
+        ``hindsight_api``, and a subclass that overrides ``predict`` directly (the test
+        doubles here, and any downstream implementation) must keep working — it simply
+        opts out of the shared retry. Every backend in this module implements
+        ``_predict`` instead, which ``TestEveryRemoteRerankerRetries`` enforces so the
+        opt-out cannot happen by accident.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement _predict() (or override predict() to opt out of retry)"
+        )
 
 
 class LocalSTCrossEncoder(CrossEncoderModel):
@@ -299,7 +333,7 @@ class LocalSTCrossEncoder(CrossEncoderModel):
         finally:
             release_local_inference_memory(self._device_type)
 
-    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+    async def _predict(self, pairs: list[tuple[str, str]]) -> list[float]:
         """
         Score query-document pairs for relevance.
 
@@ -367,7 +401,15 @@ class RemoteTEICrossEncoder(CrossEncoderModel):
         self.max_concurrent = max_concurrent
         self.max_retries = max_retries
         self.retry_delay = retry_delay
-        self._async_client: httpx.AsyncClient | None = None
+        # Idle pooled sockets are dropped before TEI (or a proxy in front of it) can
+        # close them under us, which would otherwise surface as a failed request.
+        self._session = LoopLocalSession(
+            timeout=per_phase_timeout(timeout),
+            connector_factory=lambda: aiohttp.TCPConnector(
+                keepalive_timeout=min(timeout, TEI_KEEPALIVE_EXPIRY_SECONDS)
+            ),
+        )
+        # Set by a successful initialize(); None means not initialized.
         self._model_id: str | None = None
 
         # Update global semaphore if max_concurrent changed
@@ -387,26 +429,26 @@ class RemoteTEICrossEncoder(CrossEncoderModel):
 
     async def _async_request_with_retry(
         self,
-        client: httpx.AsyncClient,
-        semaphore: asyncio.Semaphore,
+        semaphore: asyncio.Semaphore | CrossLoopSemaphore,
         method: str,
         url: str,
-        **kwargs,
-    ) -> httpx.Response:
-        """Make an async HTTP request with automatic retries on transient errors and semaphore for backpressure."""
-        last_error = None
+        **kwargs: Any,
+    ) -> Any:
+        """Make an async HTTP request with automatic retries on transient errors and semaphore for backpressure.
+
+        Returns the decoded JSON body.
+        """
+        last_error: BaseException | None = None
         delay = self.retry_delay
+        session = self._session.get()
 
         async with semaphore:
             for attempt in range(self.max_retries + 1):
                 try:
-                    if method == "GET":
-                        response = await client.get(url, **kwargs)
-                    else:
-                        response = await client.post(url, **kwargs)
-                    response.raise_for_status()
-                    return response
-                except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout) as e:
+                    async with session.request(method, url, **kwargs) as response:
+                        await raise_for_status(response)
+                        return await response.json(content_type=None)
+                except (aiohttp.ClientConnectorError, aiohttp.ServerTimeoutError, TimeoutError) as e:
                     last_error = e
                     if attempt < self.max_retries:
                         logger.warning(
@@ -415,7 +457,7 @@ class RemoteTEICrossEncoder(CrossEncoderModel):
                         )
                         await asyncio.sleep(delay)
                         delay *= 2  # Exponential backoff
-                except httpx.RequestError as e:
+                except aiohttp.ClientError as e:
                     if not is_retryable_tei_transport_error(e):
                         raise
                     last_error = e
@@ -437,13 +479,13 @@ class RemoteTEICrossEncoder(CrossEncoderModel):
                         )
                         await asyncio.sleep(delay)
                         delay *= 2  # Exponential backoff
-                except httpx.HTTPStatusError as e:
+                except UpstreamHTTPError as e:
                     # TEI uses 429 as normal overload backpressure. Retry it with
                     # the same bounded budget as transient server errors.
-                    if (e.response.status_code == 429 or e.response.status_code >= 500) and attempt < self.max_retries:
+                    if (e.status_code == 429 or e.status_code >= 500) and attempt < self.max_retries:
                         last_error = e
                         sleep_delay = tei_retry_delay(
-                            e.response,
+                            e.headers,
                             delay,
                             request_timeout=self.timeout,
                         )
@@ -456,47 +498,41 @@ class RemoteTEICrossEncoder(CrossEncoderModel):
                     else:
                         raise
 
+        assert last_error is not None  # the loop ran at least once and only exits via an error
         raise last_error
 
     async def initialize(self) -> None:
-        """Initialize the HTTP client and verify server connectivity."""
-        if self._async_client is not None:
+        """Verify server connectivity and fetch the model id.
+
+        The HTTP session itself is created lazily per event loop on first use.
+        """
+        if self._model_id is not None:
             return
 
         logger.info(
             f"Reranker: initializing TEI provider at {self.base_url} "
             f"(batch_size={self.batch_size}, max_concurrent={self.max_concurrent})"
         )
-        self._async_client = httpx.AsyncClient(
-            timeout=self.timeout,
-            limits=httpx.Limits(keepalive_expiry=min(self.timeout, TEI_KEEPALIVE_EXPIRY_SECONDS)),
-        )
 
         # Verify server is reachable and get model info
         # Use a temporary semaphore for initialization
         init_semaphore = asyncio.Semaphore(1)
         try:
-            response = await self._async_request_with_retry(
-                self._async_client, init_semaphore, "GET", f"{self.base_url}/info"
-            )
-            info = response.json()
+            info = await self._async_request_with_retry(init_semaphore, "GET", f"{self.base_url}/info")
             self._model_id = info.get("model_id", "unknown")
             logger.info(f"Reranker: TEI provider initialized (model: {self._model_id})")
-        except httpx.HTTPError as e:
-            self._async_client = None
+        except (aiohttp.ClientError, UpstreamHTTPError, TimeoutError) as e:
             raise RuntimeError(f"Failed to connect to TEI server at {self.base_url}: {e}")
 
     async def _rerank_query_group(
         self,
-        client: httpx.AsyncClient,
-        semaphore: asyncio.Semaphore,
+        semaphore: asyncio.Semaphore | CrossLoopSemaphore,
         query: str,
         texts: list[str],
     ) -> list[tuple[int, float]]:
         """Rerank a single query group and return list of (original_index, score) tuples."""
         try:
-            response = await self._async_request_with_retry(
-                client,
+            results = await self._async_request_with_retry(
                 semaphore,
                 "POST",
                 f"{self.base_url}/rerank",
@@ -507,10 +543,9 @@ class RemoteTEICrossEncoder(CrossEncoderModel):
                     "return_text": False,
                 },
             )
-            results = response.json()
             # TEI returns results sorted by score descending, with original index
             return [(result["index"], result["score"]) for result in results]
-        except httpx.HTTPError as e:
+        except (aiohttp.ClientError, UpstreamHTTPError, TimeoutError) as e:
             raise RuntimeError(f"TEI rerank request failed: {e}")
 
     async def _predict_async(self, pairs: list[tuple[str, str]]) -> list[float]:
@@ -542,9 +577,7 @@ class RemoteTEICrossEncoder(CrossEncoderModel):
         all_scores = [0.0] * len(pairs)
         semaphore = RemoteTEICrossEncoder._global_semaphore
 
-        tasks = [
-            self._rerank_query_group(self._async_client, semaphore, query, texts) for query, _, texts in tasks_info
-        ]
+        tasks = [self._rerank_query_group(semaphore, query, texts) for query, _, texts in tasks_info]
         results = await asyncio.gather(*tasks)
 
         # Map scores back to original positions
@@ -555,7 +588,7 @@ class RemoteTEICrossEncoder(CrossEncoderModel):
 
         return all_scores
 
-    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+    async def _predict(self, pairs: list[tuple[str, str]]) -> list[float]:
         """
         Score query-document pairs using the remote TEI reranker.
 
@@ -567,7 +600,7 @@ class RemoteTEICrossEncoder(CrossEncoderModel):
         Returns:
             List of relevance scores
         """
-        if self._async_client is None:
+        if self._model_id is None:
             raise RuntimeError("Reranker not initialized. Call initialize() first.")
 
         return await self._predict_async(pairs)
@@ -602,21 +635,21 @@ class _CohereCompatibleRerankClient:
         self.timeout = timeout
         self.include_top_n = include_top_n
         self.include_return_documents = include_return_documents
-        self._async_client: httpx.AsyncClient | None = None
-
-    async def initialize(self) -> None:
-        if self._async_client is not None:
-            return
-        self._async_client = httpx.AsyncClient(
-            timeout=self.timeout,
+        self.initialized = False
+        self._session = LoopLocalSession(
+            timeout=per_phase_timeout(timeout),
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             },
         )
 
+    async def initialize(self) -> None:
+        # Nothing to connect: the session is created lazily per event loop on first use.
+        self.initialized = True
+
     async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
-        if self._async_client is None:
+        if not self.initialized:
             raise RuntimeError("Reranker not initialized. Call initialize() first.")
 
         if not pairs:
@@ -641,13 +674,13 @@ class _CohereCompatibleRerankClient:
             if self.include_top_n:
                 body["top_n"] = len(texts)
 
-            response = await self._async_client.post(
+            async with self._session.get().post(
                 self.rerank_url,
                 headers=reranker_bank_attribution_headers(),
                 json=body,
-            )
-            response.raise_for_status()
-            result = response.json()
+            ) as response:
+                await raise_for_status(response)
+                result = await response.json(content_type=None)
 
             for item in result.get("results", []):
                 original_idx = item["index"]
@@ -706,7 +739,7 @@ class CohereCrossEncoder(CrossEncoderModel):
 
     async def initialize(self) -> None:
         """Initialize the Cohere client."""
-        if self._client is not None or (self._http_client and self._http_client._async_client):
+        if self._client is not None or (self._http_client and self._http_client.initialized):
             return
 
         base_url_msg = f" at {self.base_url}" if self.base_url else ""
@@ -722,10 +755,13 @@ class CohereCrossEncoder(CrossEncoderModel):
             except ImportError:
                 raise ImportError("cohere is required for CohereCrossEncoder. Install it with: pip install cohere")
 
-            self._client = cohere.Client(api_key=self.api_key, timeout=self.timeout)
+            # The async client, awaited on the loop: the sync one would need a thread per
+            # in-flight rerank. One per loop, because its pooled connections belong to the
+            # loop that opened them (the sync client it replaced had no loop affinity).
+            self._client = LoopLocal(lambda: cohere.AsyncClient(api_key=self.api_key, timeout=self.timeout))
             logger.info("Reranker: Cohere provider initialized")
 
-    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+    async def _predict(self, pairs: list[tuple[str, str]]) -> list[float]:
         """
         Score query-document pairs using the Cohere Rerank API.
 
@@ -744,12 +780,10 @@ class CohereCrossEncoder(CrossEncoderModel):
         if self._http_client is not None:
             return await self._http_client.predict(pairs)
 
-        # Run sync Cohere SDK calls in thread pool
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._predict_sync_sdk, pairs)
+        return await self._predict_sdk(pairs)
 
-    def _predict_sync_sdk(self, pairs: list[tuple[str, str]]) -> list[float]:
-        """Synchronous predict using the native Cohere SDK."""
+    async def _predict_sdk(self, pairs: list[tuple[str, str]]) -> list[float]:
+        """Predict using the native Cohere SDK's async client."""
         query_groups: dict[str, list[tuple[int, str]]] = {}
         for idx, (query, text) in enumerate(pairs):
             query_groups.setdefault(query, []).append((idx, text))
@@ -760,7 +794,7 @@ class CohereCrossEncoder(CrossEncoderModel):
             texts = [text for _, text in indexed_texts]
             indices = [idx for idx, _ in indexed_texts]
 
-            response = self._client.rerank(
+            response = await self._client.get().rerank(
                 query=query,
                 documents=texts,
                 model=self.model,
@@ -807,13 +841,13 @@ class ZeroEntropyCrossEncoder(CrossEncoderModel):
         return "zeroentropy"
 
     async def initialize(self) -> None:
-        if self._client._async_client is not None:
+        if self._client.initialized:
             return
         logger.info(f"Reranker: initializing ZeroEntropy provider with model {self.model}")
         await self._client.initialize()
         logger.info("Reranker: ZeroEntropy provider initialized")
 
-    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+    async def _predict(self, pairs: list[tuple[str, str]]) -> list[float]:
         return await self._client.predict(pairs)
 
 
@@ -849,13 +883,13 @@ class SiliconFlowCrossEncoder(CrossEncoderModel):
         return "siliconflow"
 
     async def initialize(self) -> None:
-        if self._client._async_client is not None:
+        if self._client.initialized:
             return
         logger.info(f"Reranker: initializing SiliconFlow provider at {self.base_url} with model {self.model}")
         await self._client.initialize()
         logger.info("Reranker: SiliconFlow provider initialized")
 
-    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+    async def _predict(self, pairs: list[tuple[str, str]]) -> list[float]:
         return await self._client.predict(pairs)
 
 
@@ -881,7 +915,7 @@ class RRFPassthroughCrossEncoder(CrossEncoderModel):
         """No initialization needed."""
         logger.info("Reranker: RRF passthrough provider initialized (neural reranking disabled)")
 
-    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+    async def _predict(self, pairs: list[tuple[str, str]]) -> list[float]:
         """
         Return neutral scores - actual ranking uses RRF scores from retrieval.
 
@@ -1072,7 +1106,7 @@ class FlashRankCrossEncoder(CrossEncoderModel):
         finally:
             release_local_inference_memory(self._device_type)
 
-    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+    async def _predict(self, pairs: list[tuple[str, str]]) -> list[float]:
         """
         Score query-document pairs using FlashRank.
 
@@ -1145,27 +1179,26 @@ class LiteLLMCrossEncoder(CrossEncoderModel):
         self.model = model
         self.timeout = timeout
         self.max_tokens_per_doc = max_tokens_per_doc
-        self._async_client: httpx.AsyncClient | None = None
+        self._initialized = False
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        self._session = LoopLocalSession(timeout=per_phase_timeout(timeout), headers=headers)
 
     @property
     def provider_name(self) -> str:
         return "litellm"
 
     async def initialize(self) -> None:
-        """Initialize the async HTTP client."""
-        if self._async_client is not None:
+        """Mark the provider ready; the HTTP session is created lazily per event loop."""
+        if self._initialized:
             return
 
         logger.info(f"Reranker: initializing LiteLLM provider at {self.api_base} with model {self.model}")
-
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-
-        self._async_client = httpx.AsyncClient(timeout=self.timeout, headers=headers)
+        self._initialized = True
         logger.info("Reranker: LiteLLM provider initialized")
 
-    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+    async def _predict(self, pairs: list[tuple[str, str]]) -> list[float]:
         """
         Score query-document pairs using the LiteLLM proxy's /rerank endpoint.
 
@@ -1175,7 +1208,7 @@ class LiteLLMCrossEncoder(CrossEncoderModel):
         Returns:
             List of relevance scores
         """
-        if self._async_client is None:
+        if not self._initialized:
             raise RuntimeError("Reranker not initialized. Call initialize() first.")
 
         if not pairs:
@@ -1197,7 +1230,7 @@ class LiteLLMCrossEncoder(CrossEncoderModel):
             indices = [idx for idx, _ in indexed_texts]
 
             # LiteLLM /rerank follows Cohere API format
-            response = await self._async_client.post(
+            async with self._session.get().post(
                 f"{self.api_base}/rerank",
                 headers=reranker_bank_attribution_headers(),
                 json={
@@ -1206,9 +1239,9 @@ class LiteLLMCrossEncoder(CrossEncoderModel):
                     "documents": texts,
                     "top_n": len(texts),  # Return all scores
                 },
-            )
-            response.raise_for_status()
-            result = response.json()
+            ) as response:
+                await raise_for_status(response)
+                result = await response.json(content_type=None)
 
             # Map scores back to original positions
             # Response format: {"results": [{"index": 0, "relevance_score": 0.9}, ...]}
@@ -1285,7 +1318,7 @@ class LiteLLMSDKCrossEncoder(CrossEncoderModel):
         self._initialized = True
         logger.info("Reranker: LiteLLM SDK provider initialized")
 
-    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+    async def _predict(self, pairs: list[tuple[str, str]]) -> list[float]:
         """
         Score query-document pairs using the LiteLLM SDK.
 
@@ -1444,7 +1477,7 @@ class JinaMLXCrossEncoder(CrossEncoderModel):
 
         return all_scores
 
-    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+    async def _predict(self, pairs: list[tuple[str, str]]) -> list[float]:
         if self._reranker is None:
             raise RuntimeError("Reranker not initialized. Call initialize() first.")
 
@@ -1456,7 +1489,7 @@ class GoogleCrossEncoder(CrossEncoderModel):
     """
     Google Discovery Engine cross-encoder using the Ranking REST API.
 
-    Uses httpx + google-auth for lightweight REST calls (no gRPC/protobuf).
+    Uses aiohttp + google-auth for lightweight REST calls (no gRPC/protobuf).
     Supports ADC (Application Default Credentials) or service account key file.
 
     Available models:
@@ -1494,25 +1527,28 @@ class GoogleCrossEncoder(CrossEncoderModel):
         self.service_account_key = service_account_key
         self.location = location
         self.timeout = timeout
-        self._credentials = None
-        self._client: httpx.Client | None = None
+        self._credentials: Any = None
+        self._session = LoopLocalSession(timeout=per_phase_timeout(timeout))
+        # Set by initialize(); None means not initialized.
         self._rank_url: str | None = None
 
     @property
     def provider_name(self) -> str:
         return "google"
 
-    def _get_auth_headers(self) -> dict[str, str]:
+    async def _get_auth_headers(self) -> dict[str, str]:
         """Get Authorization header with a fresh access token."""
         import google.auth.transport.requests
 
         if not self._credentials.valid:
-            self._credentials.refresh(google.auth.transport.requests.Request())
+            # google-auth has no public async refresh API: its refresh is a blocking
+            # token-endpoint round trip, so it runs in a thread rather than on the loop.
+            await asyncio.to_thread(self._credentials.refresh, google.auth.transport.requests.Request())
         return {"Authorization": f"Bearer {self._credentials.token}"}
 
     async def initialize(self) -> None:
-        """Initialize credentials and HTTP client."""
-        if self._client is not None:
+        """Initialize credentials; the HTTP session is created lazily per event loop."""
+        if self._rank_url is not None:
             return
 
         auth_method = "ADC" if not self.service_account_key else "service_account"
@@ -1538,18 +1574,32 @@ class GoogleCrossEncoder(CrossEncoderModel):
                 raise ImportError(
                     "google-auth is required for GoogleCrossEncoder. Install it with: pip install google-auth"
                 )
-            self._credentials, _ = google.auth.default(scopes=self.SCOPES)
+            # ADC discovery can probe the GCE metadata server with a blocking request, and
+            # google-auth has no async equivalent, so it runs in a thread.
+            self._credentials, _ = await asyncio.to_thread(google.auth.default, scopes=self.SCOPES)
 
         ranking_config = f"projects/{self.project_id}/locations/{self.location}/rankingConfigs/default_ranking_config"
         self._rank_url = f"{self.API_BASE}/{ranking_config}:rank"
-        self._client = httpx.Client(timeout=self.timeout)
 
         logger.info("Reranker: Google Discovery Engine provider initialized")
 
-    def _predict_sync(self, pairs: list[tuple[str, str]]) -> list[float]:
-        """Synchronous predict via REST API."""
+    async def _predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+        """
+        Score query-document pairs using Google Discovery Engine Ranking API.
+
+        Args:
+            pairs: List of (query, document) tuples to score
+
+        Returns:
+            List of relevance scores (0-1, higher = more relevant)
+        """
+        if self._rank_url is None:
+            raise RuntimeError("Reranker not initialized. Call initialize() first.")
+
         if not pairs:
             return []
+
+        session = self._session.get()
 
         # Group pairs by query
         query_groups: dict[str, list[tuple[int, str]]] = {}
@@ -1571,43 +1621,24 @@ class GoogleCrossEncoder(CrossEncoderModel):
 
                 records = [{"id": str(i), "content": text} for i, text in enumerate(batch_texts)]
 
-                response = self._client.post(
+                async with session.post(
                     self._rank_url,
-                    headers=self._get_auth_headers(),
+                    headers=await self._get_auth_headers(),
                     json={
                         "model": self.model,
                         "query": query,
                         "records": records,
                         "topN": len(records),
                     },
-                )
-                response.raise_for_status()
-                result = response.json()
+                ) as response:
+                    await raise_for_status(response)
+                    result = await response.json(content_type=None)
 
                 for record in result.get("records", []):
                     local_idx = int(record["id"])
                     all_scores[batch_indices[local_idx]] = record["score"]
 
         return all_scores
-
-    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
-        """
-        Score query-document pairs using Google Discovery Engine Ranking API.
-
-        Args:
-            pairs: List of (query, document) tuples to score
-
-        Returns:
-            List of relevance scores (0-1, higher = more relevant)
-        """
-        if self._client is None:
-            raise RuntimeError("Reranker not initialized. Call initialize() first.")
-
-        if not pairs:
-            return []
-
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._predict_sync, pairs)
 
 
 class AlibabaCloudCrossEncoder(CrossEncoderModel):
@@ -1642,13 +1673,13 @@ class AlibabaCloudCrossEncoder(CrossEncoderModel):
         return "alibaba"
 
     async def initialize(self) -> None:
-        if self._client._async_client is not None:
+        if self._client.initialized:
             return
         logger.info(f"Reranker: initializing Alibaba Cloud provider with model {self.model}")
         await self._client.initialize()
         logger.info("Reranker: Alibaba Cloud provider initialized")
 
-    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+    async def _predict(self, pairs: list[tuple[str, str]]) -> list[float]:
         return await self._client.predict(pairs)
 
 
@@ -1661,10 +1692,12 @@ class MultiCrossEncoder(CrossEncoderModel):
     ranking quality (whatever the next member gives) instead of the whole recall.
     Put ``rrf`` last to degrade to the fusion order rather than failing.
 
-    Each member keeps its own retry budget, so we only advance after a member has
-    exhausted its retries and raised. A member that fails to initialize is not
-    fatal — that is the point of the chain — it is retried lazily on the next
-    request that reaches it.
+    Each member keeps its own retry budget (``create_cross_encoder`` gives every
+    remote member a ``retry_policy``), so we only advance after a member has
+    exhausted its retries and raised — an ordinary quota blip does not burn a
+    fallback. This chain holds no policy of its own: retrying here would retry the
+    whole failover sequence rather than the member that stumbled. A member that fails to initialize is not fatal — that is the point of
+    the chain — it is retried lazily on the next request that reaches it.
     """
 
     def __init__(self, members: list[CrossEncoderModel]) -> None:
@@ -1723,7 +1756,7 @@ class MultiCrossEncoder(CrossEncoderModel):
         if not any(self._ready):
             logger.error("Reranker: no member of the failover chain initialized; recall will retry them per request")
 
-    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+    async def _predict(self, pairs: list[tuple[str, str]]) -> list[float]:
         """Score ``pairs`` with the first member that answers usably."""
         last_exc: BaseException | None = None
         for index, member in enumerate(self._members):
@@ -1757,6 +1790,34 @@ class MultiCrossEncoder(CrossEncoderModel):
         raise last_exc
 
 
+# Reranker providers that must NOT be given a retry policy, and why. Everything
+# else is a remote API whose transient failures are worth retrying.
+_RERANKER_PROVIDERS_WITHOUT_RETRY = {
+    # In-process: no round trip to fail transiently, and a local failure (a bad
+    # tensor, an OOM) is not fixed by trying again.
+    "local": "in-process model",
+    "flashrank": "in-process model",
+    "jina-mlx": "in-process model",
+    "rrf": "passthrough, does no work",
+    # Already retries internally, including TEI's 429-as-backpressure handling.
+    # A second layer would multiply its attempts by ours.
+    "tei": "own _async_request_with_retry (see tei_retry.py)",
+}
+
+
+def _reranker_retry_policy() -> RetryPolicy:
+    """Build the reranker retry policy from resolved configuration."""
+    from ..config import get_config
+
+    config = get_config()
+    return RetryPolicy(
+        max_retries=config.reranker_max_retries,
+        initial_backoff=config.reranker_initial_backoff,
+        max_backoff=config.reranker_max_backoff,
+        budget_seconds=config.reranker_retry_budget,
+    )
+
+
 def create_cross_encoder(member: RerankerMemberConfig) -> CrossEncoderModel:
     """
     Create a CrossEncoderModel for one member of the reranker chain.
@@ -1765,12 +1826,24 @@ def create_cross_encoder(member: RerankerMemberConfig) -> CrossEncoderModel:
     config) or an indexed fallback. Missing-setting errors name the member's own
     env var, so a chain misconfiguration points at the exact indexed variable.
 
+    Remote members come back carrying a ``retry_policy``, which the base class's
+    ``predict`` applies; see ``_RERANKER_PROVIDERS_WITHOUT_RETRY`` for the ones that
+    deliberately do not get one.
+
     Args:
         member: Resolved settings for this member
 
     Returns:
         Configured CrossEncoderModel instance
     """
+    encoder = _create_cross_encoder_backend(member)
+    if member.provider.lower() not in _RERANKER_PROVIDERS_WITHOUT_RETRY:
+        encoder.retry_policy = _reranker_retry_policy()
+    return encoder
+
+
+def _create_cross_encoder_backend(member: RerankerMemberConfig) -> CrossEncoderModel:
+    """Construct the provider backend itself, before any retry policy is attached."""
     provider = member.provider.lower()
 
     if provider == "tei":

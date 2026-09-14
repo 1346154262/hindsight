@@ -15,6 +15,7 @@ import httpx
 import pytest
 from openai import APIConnectionError
 
+from hindsight_api.config import clear_config_cache
 from hindsight_api.engine import llm_wrapper
 from hindsight_api.engine.llm_wrapper import (
     LLMProvider,
@@ -90,7 +91,16 @@ class TestSemaphoresForScope:
 
 
 class TestBuildPerOpSemaphores:
-    """`_build_per_op_semaphores()` reads env vars and validates them."""
+    """`_build_per_op_semaphores()` reads the resolved config and validates it.
+
+    Each case clears the config cache after setting the environment: the caps come
+    from HindsightConfig now, so the env only takes effect once the config is rebuilt.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate_config(self):
+        """Leave no rebuilt config behind for the next test to inherit."""
+        yield
 
     def test_empty_when_no_env_vars(self, monkeypatch):
         monkeypatch.delenv("HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT", raising=False)
@@ -297,7 +307,7 @@ class TestSemaphoreEnforcement:
                 provider.call(messages=[{"role": "user", "content": "unrelated"}], scope="retain"),
                 timeout=0.5,
             )
-            assert await asyncio.wait_for(retrying, timeout=3) == "ok"
+            assert (await asyncio.wait_for(retrying, timeout=3)).content == "ok"
 
         assert events == ["retrying-attempt-1", "unrelated", "retrying"]
 
@@ -381,7 +391,7 @@ class TestSemaphoreEnforcement:
             assert holder.stage == "llm.openai.retain.attempt=1/2.backoff", (
                 "backoff sleep must be visible in the stage while no permit is held"
             )
-            assert await asyncio.wait_for(task, timeout=3) == "ok"
+            assert (await asyncio.wait_for(task, timeout=3)).content == "ok"
 
     @pytest.mark.asyncio
     async def test_per_op_composes_with_global(self):

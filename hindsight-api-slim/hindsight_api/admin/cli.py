@@ -1,7 +1,7 @@
 """PostgreSQL-only admin utilities (backup, restore, migration, worker management).
 
 Not supported on Oracle backends. Uses asyncpg.connect() directly, binary COPY,
-TRUNCATE CASCADE, and REFRESH MATERIALIZED VIEW — all inherently PG-specific.
+and TRUNCATE CASCADE — all inherently PG-specific.
 """
 
 import asyncio
@@ -55,7 +55,13 @@ app = typer.Typer(name="hindsight-admin", help="Hindsight administrative command
 # are intentionally absent — admin backup/restore is PostgreSQL-only.
 BACKUP_TABLES = [
     "banks",
+    # After "banks": attachments references it, so restore's forward COPY needs
+    # the parent present, and the reversed TRUNCATE must clear the child first.
+    "attachments",
     "documents",
+    # After both of its parents: document_attachments references documents (id, bank_id)
+    # and names a attachments row.
+    "document_attachments",
     "entities",
     "chunks",
     "memory_units",
@@ -451,10 +457,6 @@ async def _restore(
                         format="binary",
                     )
 
-                # Refresh materialized view
-                typer.echo("  Refreshing materialized views...")
-                await conn.execute(f"REFRESH MATERIALIZED VIEW {_fq_table('memory_units_bm25', schema)}")
-
                 typer.echo("  Synchronizing identity sequences...")
                 await _sync_owned_sequences(conn, schema, backup_tables)
 
@@ -549,6 +551,7 @@ async def _run_migration(
     ensure_extensions: bool = True,
 ) -> list[str]:
     """Resolve database URL and run migrations for one schema or all discovered schemas."""
+    from ..engine.memories import get_memories
     from ..migrations import run_migrations_for_schemas
 
     _pg0 = parse_pg0_url(db_url)
@@ -584,6 +587,7 @@ async def _run_migration(
         text_search_extension=config.text_search_extension,
         pg_search_tokenizer=config.text_search_extension_pg_search_tokenizer,
         ensure_extensions=ensure_extensions,
+        store_owned_memories=get_memories().store_owned,
     )
 
     # After core migrations, provision any extension-owned bank-scoped tables

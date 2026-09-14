@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import logging
-import os
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
+
+from ._pg_extensions import create_extension
 
 logger = logging.getLogger(__name__)
 
@@ -140,17 +141,14 @@ _ANN_TUNING_HIGH_RECALL: dict[str, tuple[tuple[str, str], ...]] = {
     ),
 }
 
-_EXTENSION_INSTALL_SQL = {
-    "pgvector": ("CREATE EXTENSION IF NOT EXISTS vector",),
-    "pgvectorscale": (
-        "CREATE EXTENSION IF NOT EXISTS vector",
-        "CREATE EXTENSION IF NOT EXISTS vectorscale CASCADE",
-    ),
-    "vchord": ("CREATE EXTENSION IF NOT EXISTS vchord CASCADE",),
-    "scann": (
-        "CREATE EXTENSION IF NOT EXISTS vector",
-        "CREATE EXTENSION IF NOT EXISTS alloydb_scann CASCADE",
-    ),
+# (extension name, needs CASCADE) per configured backend, in install order.
+# Creation goes through _pg_extensions.create_extension so every extension lands
+# in ``public`` even when migrations run with a tenant schema on the search_path.
+_EXTENSION_INSTALL_PLAN: dict[str, tuple[tuple[str, bool], ...]] = {
+    "pgvector": (("vector", False),),
+    "pgvectorscale": (("vector", False), ("vectorscale", True)),
+    "vchord": (("vchord", True),),
+    "scann": (("vector", False), ("alloydb_scann", True)),
 }
 
 _INSTALL_HINTS = {
@@ -164,13 +162,17 @@ _INSTALL_HINTS = {
 def configured_vector_extension() -> str:
     """Return the user-configured vector backend extension.
 
-    Reads ``HINDSIGHT_API_VECTOR_EXTENSION`` (default ``"pgvector"``) and
-    validates it via :func:`validate_extension`. This is the single source of
-    truth for runtime code that needs to dispatch behaviour by vector backend;
-    callers should prefer this over reading the env var directly, so the
-    default value and the lookup mechanism live in one place.
+    Reads ``vector_extension`` off the resolved config, which is where
+    ``HINDSIGHT_API_VECTOR_EXTENSION`` and its default are parsed. This is the single
+    source of truth for runtime code that needs to dispatch behaviour by vector
+    backend; callers should prefer this over reading the env var directly.
+
+    The config import is deferred because ``config.py`` imports this module for
+    :func:`validate_extension` — at module scope the two would form a cycle.
     """
-    return validate_extension(os.getenv("HINDSIGHT_API_VECTOR_EXTENSION", "pgvector"))
+    from .config import get_config
+
+    return validate_extension(get_config().vector_extension)
 
 
 def validate_extension(name: str) -> str:
@@ -339,8 +341,8 @@ def per_bank_index_min_submit_interval_seconds() -> int:
 def bootstrap_extension(conn: Connection, ext: str) -> None:
     """Install the configured vector extension and any prerequisites if possible."""
     normalized = validate_extension(ext)
-    for statement in _EXTENSION_INSTALL_SQL[normalized]:
-        conn.execute(text(statement))
+    for name, cascade in _EXTENSION_INSTALL_PLAN[normalized]:
+        create_extension(conn, name, cascade=cascade)
 
 
 def detect_vector_extension(conn: Connection, vector_extension: str = "pgvector") -> str:

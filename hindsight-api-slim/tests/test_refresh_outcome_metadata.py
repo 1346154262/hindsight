@@ -7,6 +7,7 @@ refresh_mental_model operation must let a monitoring layer distinguish
 ``result_metadata`` alone, without a follow-up content fetch.
 """
 
+from hindsight_api.engine.response_models import LLMCallResult, TokenUsage
 import asyncio
 import uuid
 from dataclasses import dataclass, field
@@ -150,7 +151,7 @@ def _patch_delta_llm(monkeypatch, memory: MemoryEngine, *, returns) -> None:
     async def fake_call(*, messages, **kwargs):
         if isinstance(returns, Exception):
             raise returns
-        return DeltaOperationList.model_validate({"operations": returns})
+        return LLMCallResult(content=DeltaOperationList.model_validate({"operations": returns}), usage=TokenUsage())
 
     monkeypatch.setattr(memory._reflect_llm_config, "call", fake_call)
 
@@ -556,14 +557,13 @@ async def test_refresh_outcome_matrix(case: _OutcomeCase, memory: MemoryEngine, 
 
         monkeypatch.setattr(structured_doc, "structured_document_from_stored", unreadable)
     if case.structured_output_fails:
-        import types
-
         from hindsight_api.engine.reflect import agent as reflect_agent
+        from hindsight_api.engine.reflect.models import StructuredOutputResult
 
         async def extraction_yields_nothing(answer, response_schema, llm_config, reflect_id, max_tokens=None):
-            return types.SimpleNamespace(
-                structured_output=None, input_tokens=0, output_tokens=0, cached_tokens=0, thoughts_tokens=0
-            )
+            # A failed extraction carries the reason (#4230); the refresh records it
+            # in the failure detail, so the fake must be the real result type.
+            return StructuredOutputResult(error="RuntimeError: simulated extraction failure")
 
         monkeypatch.setattr(reflect_agent, "_generate_structured_output", extraction_yields_nothing)
 

@@ -31,6 +31,27 @@ function describeErrorDetails(details: unknown): string | undefined {
   return String(details);
 }
 
+/**
+ * One element of a multimodal retain item's content.
+ *
+ * Retain accepts either a plain string or an ordered list of these, so an
+ * attachment can sit inline where it actually appears and the extractor reads it
+ * alongside the prose that refers to it.
+ *
+ * `image` and `file` are separate because the providers separate them —
+ * Anthropic has image and document blocks, OpenAI has image_url and file parts.
+ */
+export type RetainAttachmentSource = {
+  type: "base64";
+  media_type: string;
+  data: string;
+};
+
+export type RetainContentBlock =
+  | { type: "text"; text: string }
+  | { type: "image"; source: RetainAttachmentSource }
+  | { type: "file"; source: RetainAttachmentSource; filename?: string };
+
 export interface WebhookHttpConfig {
   method: string;
   timeout_seconds: number;
@@ -341,7 +362,13 @@ export interface BankTemplateImportResponse {
 }
 
 export class ControlPlaneClient {
-  private async fetchApi<T>(path: string, options?: RequestInit): Promise<T> {
+  private async fetchApi<T>(
+    path: string,
+    options?: RequestInit,
+    // Bulk callers loop over many requests and report the failures themselves; one
+    // toast per failed item would bury the screen.
+    { suppressErrorToast = false }: { suppressErrorToast?: boolean } = {}
+  ): Promise<T> {
     try {
       const response = await fetch(withBasePath(path), {
         ...options,
@@ -391,24 +418,26 @@ export class ControlPlaneClient {
         const description = describeErrorDetails(errorDetails) || errorMessage;
         const status = response.status;
 
-        if (isClientError) {
-          // Client errors (4xx) - validation, bad request, etc. - show as warning
-          toast.warning("Client Error", {
-            description,
-            duration: 5000,
-          });
-        } else if (status >= 500) {
-          // Server errors (5xx) - show as error
-          toast.error("Server Error", {
-            description,
-            duration: 5000,
-          });
-        } else {
-          // Other HTTP errors - show as error
-          toast.error("API Error", {
-            description,
-            duration: 5000,
-          });
+        if (!suppressErrorToast) {
+          if (isClientError) {
+            // Client errors (4xx) - validation, bad request, etc. - show as warning
+            toast.warning("Client Error", {
+              description,
+              duration: 5000,
+            });
+          } else if (status >= 500) {
+            // Server errors (5xx) - show as error
+            toast.error("Server Error", {
+              description,
+              duration: 5000,
+            });
+          } else {
+            // Other HTTP errors - show as error
+            toast.error("API Error", {
+              description,
+              duration: 5000,
+            });
+          }
         }
 
         // Still throw error for callers that want to handle it
@@ -421,7 +450,7 @@ export class ControlPlaneClient {
       return response.json();
     } catch (error) {
       // If it's not a response error (network error, etc.), show toast
-      if (!(error as any).status) {
+      if (!(error as any).status && !suppressErrorToast) {
         toast.error("Network Error", {
           description: error instanceof Error ? error.message : "Failed to connect to server",
           duration: 5000,
@@ -540,7 +569,11 @@ export class ControlPlaneClient {
   async retain(params: {
     bank_id: string;
     items: Array<{
-      content: string;
+      /**
+       * Raw content: a plain string, or ordered blocks so an image sits inline
+       * where it appears. The block form needs a vision-capable retain LLM.
+       */
+      content: string | Array<RetainContentBlock>;
       timestamp?: string;
       context?: string;
       document_id?: string;
@@ -666,7 +699,7 @@ export class ControlPlaneClient {
   }
 
   /**
-   * Cancel a pending operation
+   * Cancel a pending or in-flight operation
    */
   async cancelOperation(bankId: string, operationId: string) {
     return this.fetchApi<{
@@ -990,14 +1023,18 @@ export class ControlPlaneClient {
   /**
    * Delete an entire memory bank and all its data
    */
-  async deleteBank(bankId: string) {
+  async deleteBank(bankId: string, options?: { suppressErrorToast?: boolean }) {
     return this.fetchApi<{
       success: boolean;
       message: string;
       deleted_count: number;
-    }>(bankApi(bankId), {
-      method: "DELETE",
-    });
+    }>(
+      bankApi(bankId),
+      {
+        method: "DELETE",
+      },
+      { suppressErrorToast: options?.suppressErrorToast }
+    );
   }
 
   /**
@@ -1192,20 +1229,32 @@ export class ControlPlaneClient {
   }
 
   /**
-   * Get bank profile
+   * Get a bank's profile: its display name, disposition traits and reflect mission.
+   *
+   * There is no profile endpoint any more — the traits and the mission are bank
+   * configuration, and the display name lives on the bank listing — so this composes
+   * the two reads. The name lookup is best-effort: a bank past the first page of a
+   * large deployment still resolves because the list is filtered by id, but if it
+   * cannot be found the id itself is the label.
    */
   async getBankProfile(bankId: string) {
-    return this.fetchApi<{
-      bank_id: string;
-      name: string;
+    const [configResp, banksResp] = await Promise.all([
+      this.getBankConfig(bankId),
+      this.listBanks({ q: bankId, limit: 100 }).catch(() => ({ banks: [] as any[] })),
+    ]);
+    const config = configResp.config ?? {};
+    const trait = (key: string) => Number(config[key] ?? 3);
+    const listed = banksResp.banks.find((bank) => bank.bank_id === bankId);
+    return {
+      bank_id: bankId,
+      name: (listed?.name as string | undefined) || bankId,
       disposition: {
-        skepticism: number;
-        literalism: number;
-        empathy: number;
-      };
-      mission: string;
-      background?: string; // Deprecated, kept for backwards compatibility
-    }>(`/api/profile/${encodeURIComponent(bankId)}`);
+        skepticism: trait("disposition_skepticism"),
+        literalism: trait("disposition_literalism"),
+        empathy: trait("disposition_empathy"),
+      },
+      mission: (config.reflect_mission as string | undefined) ?? "",
+    };
   }
 
   /**
@@ -1442,10 +1491,16 @@ export class ControlPlaneClient {
    * consolidated with. Returns every distinct scope (tag order normalized) with
    * the number of observations in it; the empty tag list is the global scope.
    */
-  async listObservationScopes(bankId: string) {
+  async listObservationScopes(bankId: string, params?: { limit?: number; offset?: number }) {
+    const query = new URLSearchParams();
+    if (params?.limit !== undefined) query.append("limit", String(params.limit));
+    if (params?.offset !== undefined) query.append("offset", String(params.offset));
     return this.fetchApi<{
       scopes: Array<{ tags: string[]; count: number }>;
-    }>(bankApi(bankId, `/observations/scopes`));
+      total: number;
+      limit: number;
+      offset: number;
+    }>(bankApi(bankId, `/observations/scopes${query.toString() ? `?${query}` : ""}`));
   }
 
   // ============= TAGS =============
@@ -1506,8 +1561,9 @@ export class ControlPlaneClient {
       params.append("offset", String(options.offset));
     }
     const query = params.toString();
-    // Shape of the default detail="full"; lighter levels omit the fields below
-    // last_refreshed_at, so narrow the result when you ask for one.
+    // Shape of detail="full"; the endpoint DEFAULTS to "metadata", which omits
+    // source_query/content/max_tokens/trigger (they come back null), so pass
+    // detail explicitly when you need any of the fields below last_refreshed_at.
     return this.fetchApi<{
       items: Array<{
         id: string;
@@ -1929,6 +1985,93 @@ export class ControlPlaneClient {
   }
 
   /**
+   * Render the prompts an operation would send for this bank — no LLM call, no writes.
+   *
+   * Everything that shapes the prompt is read from the bank, so what comes back is
+   * the bank's *saved* configuration — there is nothing to override. Both messages
+   * come back, in send order, because a mission is not always in the system prompt:
+   * retain and consolidation keep theirs bank-agnostic and put the mission in the
+   * user message. Each message arrives as the `blocks` it is built from — the active
+   * ones concatenate back to its text — and each names the setting behind it,
+   * including settings that are currently switched off.
+   */
+  async previewPrompt(
+    bankId: string,
+    operation: "retain" | "consolidation" | "reflect",
+    strategy?: string | null
+  ) {
+    return this.fetchApi<{
+      messages: {
+        role: "system" | "user";
+        /** Active blocks concatenate to the message exactly as sent. */
+        blocks: {
+          text: string;
+          source: "config" | "builtin";
+          /** Config field behind the block; empty when no single field owns it. */
+          field: string;
+          /** Slug for a part no field owns: bank_identity, disposition, directives. */
+          section: string;
+          /** The heading the prompt text carries here, extracted from the prompt itself. */
+          heading: string;
+          /** False for a setting that is switched off, shown where it would land. */
+          active: boolean;
+          value?: string | null;
+          kind: "text" | "boolean" | "choice" | "complex";
+          choices?: string[] | null;
+          /** False for server-level fields, which shape the prompt but cannot be set per bank. */
+          editable: boolean;
+        }[];
+      }[];
+      /** The retain strategy these prompts were rendered under, if any. */
+      strategy?: string | null;
+      /** The bank's retain strategy names, so a picker needs no second call. */
+      strategies?: string[];
+      /** Settings that shape the run without appearing in the prompt, such as chunk sizes. */
+      run_settings?: {
+        field: string;
+        value?: string | null;
+        kind: "text" | "boolean" | "choice" | "complex";
+        editable: boolean;
+      }[];
+      response_schema?: Record<string, unknown> | null;
+      /** Set when the configuration means no prompt is sent at all (chunks mode). */
+      skipped_reason?: string | null;
+    }>(bankApi(bankId, "/prompts/preview"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ operation, strategy: strategy ?? null }),
+    });
+  }
+
+  /**
+   * Extract facts from sample text without storing anything — a real LLM call.
+   *
+   * The paid half of the prompt tester: `previewPrompt` shows what would be sent,
+   * this shows what comes back. Runs under the same strategy-resolved config a real
+   * retain would, so what it extracts is what retain would extract.
+   */
+  async dryRunExtract(bankId: string, content: string, strategy?: string | null) {
+    return this.fetchApi<{
+      facts: {
+        text: string;
+        fact_type: string;
+        entities: string[];
+        occurred_start?: string | null;
+        occurred_end?: string | null;
+        /** Index into `chunks` of the chunk this fact came from. */
+        chunk_index?: number | null;
+      }[];
+      /** The chunks the input was cut into before extraction. */
+      chunks?: { text: string; fact_count: number }[];
+      usage?: Record<string, unknown> | null;
+    }>(bankApi(bankId, "/memories/dry-run-extract"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content, strategy: strategy ?? null }),
+    });
+  }
+
+  /**
    * Update bank configuration overrides
    */
   async updateBankConfig(bankId: string, updates: Record<string, any>) {
@@ -1958,8 +2101,16 @@ export class ControlPlaneClient {
   /**
    * List webhooks for a bank
    */
-  async listWebhooks(bankId: string): Promise<{ items: Webhook[] }> {
-    return this.fetchApi<{ items: Webhook[] }>(bankApi(bankId, "/webhooks"));
+  async listWebhooks(
+    bankId: string,
+    params?: { limit?: number; offset?: number }
+  ): Promise<{ items: Webhook[]; total: number; limit: number; offset: number }> {
+    const query = new URLSearchParams();
+    if (params?.limit !== undefined) query.append("limit", String(params.limit));
+    if (params?.offset !== undefined) query.append("offset", String(params.offset));
+    return this.fetchApi<{ items: Webhook[]; total: number; limit: number; offset: number }>(
+      bankApi(bankId, `/webhooks${query.toString() ? `?${query}` : ""}`)
+    );
   }
 
   /**

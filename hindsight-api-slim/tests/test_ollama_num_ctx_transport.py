@@ -11,13 +11,13 @@ default and re-tunes it for every other consumer of a shared host; the startup
 
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
-import httpx
 import pytest
 from pydantic import BaseModel
 
 from hindsight_api.engine.providers.openai_compatible_llm import OpenAICompatibleLLM
+from tests.ollama_stub import chat_body, ollama_stub
 
 NUM_CTX = 24576
 
@@ -26,58 +26,36 @@ class _Answer(BaseModel):
     answer: str
 
 
-def _native_response(content: str) -> httpx.Response:
-    request = httpx.Request("POST", "http://localhost:11434/api/chat")
-    return httpx.Response(
-        200,
-        json={
-            "model": "llama3.2",
-            "message": {"role": "assistant", "content": content},
-            "done": True,
-            "done_reason": "stop",
-            "prompt_eval_count": 11,
-            "eval_count": 3,
-        },
-        request=request,
-    )
+def _native_response(content: str) -> dict:
+    return chat_body(content, done_reason="stop", prompt_eval_count=11, eval_count=3)
 
 
-def _make_llm(**kwargs) -> OpenAICompatibleLLM:
+def _make_llm(base_url: str, **kwargs) -> OpenAICompatibleLLM:
     return OpenAICompatibleLLM(
         provider="ollama",
         api_key="",
-        base_url="http://localhost:11434/v1",
+        base_url=base_url,
         model="llama3.2",
         **kwargs,
-    )
-
-
-def _patch_native(*responses: httpx.Response):
-    """Patch httpx.AsyncClient so native /api/chat posts return ``responses`` in order."""
-    client = AsyncMock()
-    client.post.side_effect = list(responses)
-    client.__aenter__.return_value = client
-    return client, patch(
-        "hindsight_api.engine.providers.openai_compatible_llm.httpx.AsyncClient",
-        return_value=client,
     )
 
 
 @pytest.mark.asyncio
 async def test_free_form_call_goes_native_and_carries_num_ctx():
     """A configured num_ctx routes free-form calls to the endpoint that honours it."""
-    llm = _make_llm(ollama_num_ctx=NUM_CTX)
-    client, patched = _patch_native(_native_response("hello there"))
+    async with ollama_stub(_native_response("hello there")) as stub:
+        llm = _make_llm(stub.openai_base_url, ollama_num_ctx=NUM_CTX)
+        result = (
+            await llm.call(
+                messages=[{"role": "user", "content": "hi"}],
+                max_completion_tokens=64,
+                max_retries=0,
+            )
+        ).content
+        await llm.cleanup()
 
-    with patched:
-        result = await llm.call(
-            messages=[{"role": "user", "content": "hi"}],
-            max_completion_tokens=64,
-            max_retries=0,
-        )
-
-    payload = client.post.call_args.kwargs["json"]
-    assert client.post.call_args.args[0] == "http://localhost:11434/api/chat"
+    payload = stub.requests[-1].json
+    assert stub.requests[-1].path == "/api/chat"
     assert payload["options"]["num_ctx"] == NUM_CTX
     assert "format" not in payload  # free-form: no schema enforcement
     assert result == "hello there"
@@ -86,51 +64,50 @@ async def test_free_form_call_goes_native_and_carries_num_ctx():
 @pytest.mark.asyncio
 async def test_verify_connection_probe_carries_num_ctx():
     """The startup probe must not reload the model at the server default (#3599)."""
-    llm = _make_llm(ollama_num_ctx=NUM_CTX)
-    client, patched = _patch_native(_native_response("ok"))
-
-    with patched:
+    async with ollama_stub(_native_response("ok")) as stub:
+        llm = _make_llm(stub.openai_base_url, ollama_num_ctx=NUM_CTX)
         await llm.verify_connection()
+        await llm.cleanup()
 
-    assert client.post.call_args.args[0] == "http://localhost:11434/api/chat"
-    assert client.post.call_args.kwargs["json"]["options"]["num_ctx"] == NUM_CTX
+    assert stub.requests[-1].path == "/api/chat"
+    assert stub.requests[-1].json["options"]["num_ctx"] == NUM_CTX
 
 
 @pytest.mark.asyncio
 async def test_free_form_call_without_num_ctx_stays_on_openai_endpoint():
     """Unset override keeps the existing transport, so nothing changes by default."""
-    llm = _make_llm()
-    create = AsyncMock(
-        return_value=SimpleNamespace(
-            choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content="hello there"))],
-            usage=None,
+    async with ollama_stub(_native_response("unused")) as stub:
+        llm = _make_llm(stub.openai_base_url)
+        create = AsyncMock(
+            return_value=SimpleNamespace(
+                choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content="hello there"))],
+                usage=None,
+            )
         )
-    )
-    llm._client.chat.completions.create = create
-    client, patched = _patch_native(_native_response("unused"))
-
-    with patched:
-        result = await llm.call(messages=[{"role": "user", "content": "hi"}], max_retries=0)
+        llm._client.chat.completions.create = create
+        result = (await llm.call(messages=[{"role": "user", "content": "hi"}], max_retries=0)).content
+        await llm.cleanup()
 
     assert result == "hello there"
     assert create.await_count == 1
-    client.post.assert_not_called()
+    assert stub.requests == []
 
 
 @pytest.mark.asyncio
 async def test_structured_call_still_validates_against_the_schema():
     """Routing free-form calls native must not disturb the structured path."""
-    llm = _make_llm(ollama_num_ctx=NUM_CTX)
-    client, patched = _patch_native(_native_response(json.dumps({"answer": "42"})))
+    async with ollama_stub(_native_response(json.dumps({"answer": "42"}))) as stub:
+        llm = _make_llm(stub.openai_base_url, ollama_num_ctx=NUM_CTX)
+        result = (
+            await llm.call(
+                messages=[{"role": "user", "content": "hi"}],
+                response_format=_Answer,
+                max_retries=0,
+            )
+        ).content
+        await llm.cleanup()
 
-    with patched:
-        result = await llm.call(
-            messages=[{"role": "user", "content": "hi"}],
-            response_format=_Answer,
-            max_retries=0,
-        )
-
-    assert "format" in client.post.call_args.kwargs["json"]
+    assert "format" in stub.requests[-1].json
     assert isinstance(result, _Answer)
     assert result.answer == "42"
 
@@ -138,11 +115,10 @@ async def test_structured_call_still_validates_against_the_schema():
 @pytest.mark.asyncio
 async def test_free_form_native_strips_reasoning_tags():
     """Reasoning models leak <think> blocks into the body, as on the other path."""
-    llm = _make_llm(ollama_num_ctx=NUM_CTX)
-    client, patched = _patch_native(_native_response("<think>weighing it up</think>Paris"))
-
-    with patched:
-        result = await llm.call(messages=[{"role": "user", "content": "hi"}], max_retries=0)
+    async with ollama_stub(_native_response("<think>weighing it up</think>Paris")) as stub:
+        llm = _make_llm(stub.openai_base_url, ollama_num_ctx=NUM_CTX)
+        result = (await llm.call(messages=[{"role": "user", "content": "hi"}], max_retries=0)).content
+        await llm.cleanup()
 
     assert result == "Paris"
 
@@ -150,16 +126,17 @@ async def test_free_form_native_strips_reasoning_tags():
 @pytest.mark.asyncio
 async def test_free_form_native_retries_empty_content():
     """An empty message is retried rather than returned as a valid empty answer."""
-    llm = _make_llm(ollama_num_ctx=NUM_CTX)
-    client, patched = _patch_native(_native_response(""), _native_response("second try"))
-
-    with patched:
-        result = await llm.call(
-            messages=[{"role": "user", "content": "hi"}],
-            max_retries=1,
-            initial_backoff=0.0,
-            max_backoff=0.0,
-        )
+    async with ollama_stub(_native_response(""), _native_response("second try")) as stub:
+        llm = _make_llm(stub.openai_base_url, ollama_num_ctx=NUM_CTX)
+        result = (
+            await llm.call(
+                messages=[{"role": "user", "content": "hi"}],
+                max_retries=1,
+                initial_backoff=0.0,
+                max_backoff=0.0,
+            )
+        ).content
+        await llm.cleanup()
 
     assert result == "second try"
-    assert client.post.await_count == 2
+    assert len(stub.requests) == 2

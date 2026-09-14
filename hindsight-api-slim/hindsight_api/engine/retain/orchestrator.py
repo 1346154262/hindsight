@@ -14,7 +14,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ...extensions.memory_defense import (
     DefenseAction,
@@ -25,8 +25,12 @@ from ...extensions.memory_defense import (
 )
 from ...metrics import get_metrics_collector
 from ...worker.stage import set_stage
+from ..chunk_ids import build_chunk_id
 from ..db_utils import acquire_with_retry
 from ..memory_engine import count_tokens, fq_table
+
+if TYPE_CHECKING:
+    from .attachment_store import RetainAttachmentLoader
 
 
 @dataclass
@@ -55,7 +59,7 @@ def redact_document_body(body: str, config: Any) -> str:
     """Apply Memory Defense redaction to a document body.
 
     Per-item screening only scrubs the chunked content that goes through
-    `screen()`. A `document_body_override` (the full original text of an
+    `screen()`. A `full_document_body` (the full original text of an
     oversized item — see `_split_contents_into_sub_batches`) never goes through
     `screen()` and would otherwise persist verbatim into
     `documents.original_text`, so the splitting caller runs it through this
@@ -87,9 +91,80 @@ def redact_document_body(body: str, config: Any) -> str:
     return apply_redaction(body).content
 
 
+def merge_json_array_parts(texts: list[str]) -> str | None:
+    """The parts as ONE JSON array, when every one of them is a JSON array of objects; else None.
+
+    A conversation stored as a single JSON array must stay valid JSON across an append. Joining the
+    parts with a newline would produce ``"[...]\n[...]"``, which the next append cycle's
+    ``chunk_text()`` cannot parse — it falls through to sentence-boundary splitting and speaker
+    attribution breaks (#2409).
+    """
+    merged: list = []
+    try:
+        for text in texts:
+            parsed = json.loads(text)
+            if not (isinstance(parsed, list) and all(isinstance(e, dict) for e in parsed)):
+                return None
+            merged.extend(parsed)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return None
+    return json.dumps(merged, ensure_ascii=False)
+
+
+def join_document_parts(texts: list[str]) -> str:
+    """The single definition of how a document's content parts become its stored body."""
+    merged = merge_json_array_parts(texts)
+    return merged if merged is not None else "\n".join(texts)
+
+
+def append_document_body(existing_text: str, incoming_text: str) -> str:
+    """The body an APPEND produces: the stored document with the new tail on it.
+
+    The splitter calls this to report an oversized append's body BEFORE the retain that builds it
+    (see ``_iter_raw_sub_batches``), and ``retain_batch`` below builds the real thing by prepending
+    the stored body as an extra content item. Both go through ``join_document_parts`` so they
+    cannot disagree — when they did, the slice reported only the new tail, ``original_text`` was
+    truncated to it, and the next append tombstoned the facts of everything it had dropped (#3989).
+    """
+    return join_document_parts([existing_text, incoming_text])
+
+
+class AppendWouldTruncateDocument(Exception):
+    """An append produced a body that does not extend the document it was appending to.
+
+    An append is monotonic by definition: whatever it writes must start with what was stored. When
+    that does not hold, the write is about to DESTROY committed content — and silently, because the
+    chunks come from the real content, so extraction still looks correct and only the stored body
+    is wrong. That is exactly how #3989 went unnoticed: an oversized append reported the new tail
+    as the whole document, and the next append diffed against the truncated body and tombstoned the
+    facts of the turns that were no longer in it.
+
+    Raised rather than logged. A failed append is recoverable — the caller resubmits, and retain is
+    idempotent by ``operation_id`` — whereas a truncating one is not.
+    """
+
+
+def assert_append_extends_stored_body(
+    stored_original_text: str | None,
+    new_body: str,
+    *,
+    document_id: str,
+) -> None:
+    """Guard the monotonicity of an append. See ``AppendWouldTruncateDocument``."""
+    if not stored_original_text:
+        return
+    if _is_strict_append_of_stored_document(stored_original_text, new_body):
+        return
+    sanitized = fact_extraction._sanitize_text(new_body) or ""
+    raise AppendWouldTruncateDocument(
+        f"append to {document_id} produced a {len(sanitized):,}-char body that does not extend the "
+        f"stored {len(stored_original_text):,}-char one; refusing to overwrite it"
+    )
+
+
 def _is_strict_append_of_stored_document(
     stored_original_text: str | None,
-    document_body_override: str | None,
+    full_document_body: str | None,
 ) -> bool:
     """Return whether an oversized document body strictly appends stored text.
 
@@ -97,10 +172,10 @@ def _is_strict_append_of_stored_document(
     arrives Memory Defense redacted — see ``redact_document_body``), so apply
     the same sanitization before comparing it with the stored prefix.
     """
-    if stored_original_text is None or document_body_override is None:
+    if stored_original_text is None or full_document_body is None:
         return False
 
-    sanitized_body = fact_extraction._sanitize_text(document_body_override) or ""
+    sanitized_body = fact_extraction._sanitize_text(full_document_body) or ""
     return len(sanitized_body) > len(stored_original_text) and sanitized_body.startswith(stored_original_text)
 
 
@@ -270,6 +345,7 @@ from . import (
 )
 from . import timing as _timing
 from .embedding_coalescer import CoalescingEmbedder
+from .entity_labels import label_tag_keys
 from .memory_budget import RetainMemoryBudget, estimate_chunk_bytes
 from .types import (
     CausalRelation,
@@ -515,6 +591,20 @@ def _remap_phase1_results(
     return remapped_entity_to_unit, remapped_unit_to_entity_ids, remapped_semantic
 
 
+def _attachment_filenames_for(contents: "list[RetainContent]") -> dict[str, str]:
+    """Merge the per-item filename maps of everything going into one document.
+
+    A retain item carries the names the caller gave its own attachments; a
+    document can be assembled from several items. Later items win on a clash,
+    which only arises when one document attaches identical bytes twice under two
+    names — in which case either answer is arbitrary and the row holds one name.
+    """
+    merged: dict[str, str] = {}
+    for content in contents:
+        merged.update(content.attachment_filenames)
+    return merged
+
+
 async def _insert_facts_and_links(
     conn,
     entity_resolver,
@@ -646,6 +736,7 @@ async def _streaming_session_retain(
     doc_replace_done: list[bool],
     entity_resolver,
     log_buffer: list[str],
+    attachment_filenames: dict[str, str] | None = None,
 ) -> list[list[str]]:
     """Hand one consumer batch to the store's retain session.
 
@@ -658,14 +749,14 @@ async def _streaming_session_retain(
     yet. That is deliberate: the ids are the engine's, and a retain that is still buffering has to
     be able to answer with them.
     """
-    from ..memories.base import RetainDocumentPart, build_fact_records
+    from ..memories.base import RetainDocumentPart, build_fact_records, document_record_metadata
     from . import entity_processing, fact_storage
     from .entity_processing import UserEntities
 
     chunk_id_by_index = {}
     if batch_chunk_meta:
         chunk_id_by_index = {
-            cm.chunk_index: f"{bank_id}_{effective_doc_id}_{cm.chunk_index}" for cm in batch_chunk_meta
+            cm.chunk_index: build_chunk_id(bank_id, effective_doc_id, cm.chunk_index) for cm in batch_chunk_meta
         }
     for fact, processed_fact in zip(batch_extracted, batch_processed, strict=True):
         processed_fact.document_id = effective_doc_id
@@ -713,7 +804,9 @@ async def _streaming_session_retain(
             chunk_texts=[],
             facts=records,
             tags=list(merged_tags or []),
-            metadata=({"retain_params": json.dumps(retain_params)} if retain_params else {}),
+            # Whichever part of a document reaches the session first supplies its record metadata,
+            # so this must be the WHOLE document's map, never just this batch's items' names.
+            metadata=document_record_metadata(retain_params, attachment_filenames),
             entity_names=names,
             replace_chunk_ids=replace_chunk_ids,
         )
@@ -780,7 +873,7 @@ async def _streaming_store_owned_retain(
     chunk_id_by_index = {}
     if batch_chunk_meta:
         chunk_id_by_index = {
-            cm.chunk_index: f"{bank_id}_{effective_doc_id}_{cm.chunk_index}" for cm in batch_chunk_meta
+            cm.chunk_index: build_chunk_id(bank_id, effective_doc_id, cm.chunk_index) for cm in batch_chunk_meta
         }
     for fact, processed_fact in zip(batch_extracted, batch_processed):
         processed_fact.document_id = effective_doc_id
@@ -855,7 +948,7 @@ async def _streaming_store_owned_retain(
             doc_replace_done[0] = True
         log_buffer.append(
             f"[streaming] pg-free retain doc={effective_doc_id} units={len(unit_ids)} "
-            f"seq={resp.seq} new_entities={resp.new_entities}"
+            f"seq={resp.get('seq')} new_entities={resp.get('new_entities', 0)}"
         )
     # Mark the document tracked so the post-loop "no facts / not-yet-tracked" finalizer does NOT
     # fire. That finalizer (a) writes a Postgres documents row and (b) runs handle_document_tracking,
@@ -881,7 +974,7 @@ async def _delta_store_owned_write(
     contents_dicts: list,
     delta_contents: list,
     document_tags,
-    document_body_override,
+    full_document_body,
     extracted_facts: list,
     processed_facts: list,
     new_chunk_metadata,
@@ -902,8 +995,8 @@ async def _delta_store_owned_write(
     Returns `(committed, result_unit_ids)`. `False` means the caller falls back to the streaming
     retain — the document moved under this write, and the diff it planned is stale.
     """
-    if document_body_override is not None:
-        combined_content = document_body_override
+    if full_document_body is not None:
+        combined_content = full_document_body
     else:
         combined_content = "\n".join([c.get("content", "") for c in contents_dicts])
     retain_params, merged_tags = _build_retain_params(contents_dicts, document_tags)
@@ -940,7 +1033,7 @@ async def _delta_store_owned_write(
     # Deterministic chunk ids for the new/changed chunks, after the delta remap, so a fact's
     # chunk_id matches the chunk that carries it.
     chunk_id_by_index = {
-        cm.chunk_index: f"{bank_id}_{effective_doc_id}_{cm.chunk_index}" for cm in (new_chunk_metadata or [])
+        cm.chunk_index: build_chunk_id(bank_id, effective_doc_id, cm.chunk_index) for cm in (new_chunk_metadata or [])
     }
     for ef, pf in zip(extracted_facts, processed_facts):
         pf.document_id = effective_doc_id
@@ -1019,8 +1112,8 @@ async def _delta_store_owned_write(
         )
         log_buffer.append(
             f"[delta] store-owned retain doc={effective_doc_id} units={len(unit_ids or [])} "
-            f"replaced_chunks={len(replace_chunk_ids)} seq={resp.seq} "
-            f"new_entities={resp.new_entities}"
+            f"replaced_chunks={len(replace_chunk_ids)} seq={resp.get('seq')} "
+            f"new_entities={resp.get('new_entities', 0)}"
         )
 
     log_buffer.append(f"DELTA RETAIN COMPLETE (store-owned): {len(processed_facts)} new units")
@@ -1044,6 +1137,8 @@ async def _extract_and_embed(
     pool: Any = None,
     operation_id: str | None = None,
     schema: str | None = None,
+    attachment_loader: "RetainAttachmentLoader | None" = None,
+    vlm_config: "LLMConfig | None" = None,
 ) -> _EmbeddedExtraction:
     """Shared pipeline: extract facts from contents and generate embeddings."""
     set_stage("retain.extract_and_embed")
@@ -1057,7 +1152,14 @@ async def _extract_and_embed(
     # so in the item's `context`, which extraction already reads and which the dry-run
     # `agent_name` override is deprecated in favour of.
     extraction = await fact_extraction.extract_facts_from_contents(
-        contents, llm_config, config, pool, operation_id, schema
+        contents,
+        llm_config,
+        config,
+        pool,
+        operation_id,
+        schema,
+        attachment_loader=attachment_loader,
+        vlm_config=vlm_config,
     )
     extracted_facts, chunks, usage = extraction.facts, extraction.chunks, extraction.usage
     log_buffer.append(
@@ -1182,7 +1284,7 @@ async def retain_batch(
     outbox_callback: RetainOutboxCallback | None = None,
     outbox_callback_factory: RetainOutboxCallbackFactory | None = None,
     db_semaphore: "asyncio.Semaphore | None" = None,
-    document_body_override: str | None = None,
+    full_document_body: str | None = None,
     document_body_hash: str | None = None,
     chunk_index_offset: int = 0,
     body_accum: "dict[str, DocumentBodyAccumulator] | None" = None,
@@ -1192,6 +1294,8 @@ async def retain_batch(
     webhook_manager: Any = None,
     memory_defense_extension: "MemoryDefenseExtension | None" = None,
     audit_logger: Any = None,
+    attachment_loader: "RetainAttachmentLoader | None" = None,
+    vlm_config: "LLMConfig | None" = None,
 ) -> RetainBatchResult:
     """
     Process a batch of content through the retain pipeline.
@@ -1320,7 +1424,7 @@ async def retain_batch(
                     outbox_callback=group_outbox_callback,
                     outbox_callback_factory=outbox_callback_factory,
                     db_semaphore=db_semaphore,
-                    document_body_override=document_body_override,
+                    full_document_body=full_document_body,
                     chunk_index_offset=chunk_index_offset,
                     progress_callback=progress_callback,
                     webhook_manager=webhook_manager,
@@ -1528,6 +1632,11 @@ async def retain_batch(
             )
         existing_text = base_row["original_text"] if base_row else None
         append_base_hash = base_row["content_hash"] if base_row else _APPEND_BASE_ABSENT
+        # The stored document's attachment names, carried onto the prepended base below. A
+        # store-owned record's metadata is REPLACED on every write, so an append that did not
+        # restate them would erase every name the earlier turns gave. (A SQL bank merges them in
+        # `sync_document_attachments` instead, so this stays empty there.)
+        prior_filenames: dict[str, str] = {}
         # The base text comes from whichever store HOLDS it. For a store that owns the document
         # store the SQL row keeps only metadata and `original_text` is NULL by construction
         # (`fact_storage.upsert_document_metadata`), so this read returned nothing to prepend and
@@ -1539,7 +1648,10 @@ async def retain_batch(
         if not existing_text and _store.store_owned_for(bank_id):
             _record = await _store.get_document_record(bank_id=bank_id, document_id=effective_doc_id, include_text=True)
             if _record:
+                from ..memories.base import document_attachment_filenames
+
                 existing_text = _record.get("original_text")
+                prior_filenames = document_attachment_filenames(_record)
                 # Read WITH the base, not later: a watermark taken after the read would already
                 # include a writer that beat us, and the guard would pass while the base was stale.
                 append_base_watermark = _record.get("watermark")
@@ -1552,6 +1664,9 @@ async def retain_batch(
         if existing_text:
             # Prepend existing text as a new content item at the beginning
             existing_content: RetainContentDict = {"content": existing_text}
+            if prior_filenames:
+                # First, so a name the new turn gives the same attachment wins.
+                existing_content["attachment_filenames"] = prior_filenames
             # Copy context/tags from first item for consistency
             first = contents_dicts[0]
             if first.get("context"):
@@ -1565,39 +1680,39 @@ async def retain_batch(
             if first.get("tags"):
                 existing_content["tags"] = first["tags"]
             contents_dicts = [existing_content, *contents_dicts]
-            # Merge JSON arrays to keep original_text valid (#2409).
-            # Without this, combined_content joins items with "\n", producing
-            # "[...]\n[...]" which is not valid JSON. On the next append cycle
-            # chunk_text() fails to parse it and falls through to sentence-
-            # boundary text splitting, breaking speaker attribution.
-            try:
-                _merged = []
+            # Collapse to the merged array when every part is one, so `original_text` stays valid
+            # JSON (#2409). `merge_json_array_parts` is the same function the splitter predicts an
+            # oversized append's body with, so the two cannot disagree about what this produces.
+            _merged_text = merge_json_array_parts([_item.get("content", "") for _item in contents_dicts])
+            if _merged_text is not None:
+                merged_item: RetainContentDict = {"content": _merged_text}
+                merged_filenames: dict[str, str] = {}
                 for _item in contents_dicts:
-                    _parsed = json.loads(_item.get("content", ""))
-                    if isinstance(_parsed, list) and all(isinstance(_e, dict) for _e in _parsed):
-                        _merged.extend(_parsed)
-                    else:
-                        _merged = None
-                        break
-                if _merged is not None:
-                    contents_dicts = [{"content": json.dumps(_merged, ensure_ascii=False)}]
-                    if first.get("context"):
-                        contents_dicts[0]["context"] = first["context"]
-                    if first.get("event_date"):
-                        contents_dicts[0]["event_date"] = first["event_date"]
-                    if first.get("metadata"):
-                        contents_dicts[0]["metadata"] = first["metadata"]
-                    if first.get("observation_scopes") is not None:
-                        contents_dicts[0]["observation_scopes"] = first["observation_scopes"]
-                    if first.get("tags"):
-                        contents_dicts[0]["tags"] = first["tags"]
-            except (json.JSONDecodeError, ValueError, TypeError):
-                pass
+                    merged_filenames.update(_item.get("attachment_filenames") or {})
+                if merged_filenames:
+                    merged_item["attachment_filenames"] = merged_filenames
+                if first.get("context"):
+                    merged_item["context"] = first["context"]
+                if first.get("event_date"):
+                    merged_item["event_date"] = first["event_date"]
+                if first.get("metadata"):
+                    merged_item["metadata"] = first["metadata"]
+                if first.get("observation_scopes") is not None:
+                    merged_item["observation_scopes"] = first["observation_scopes"]
+                if first.get("tags"):
+                    merged_item["tags"] = first["tags"]
+                contents_dicts = [merged_item]
             # Rebuild contents list to match
             contents = _build_contents(contents_dicts, document_tags)
             log_buffer.append(
                 f"[append] Prepended {len(existing_text):,} chars from existing document {effective_doc_id}"
             )
+            # An oversized append's body is PREDICTED by the splitter (`full_document_body`) rather
+            # than built here, so this is the one place both the prediction and the base it must
+            # extend are in hand. Free to check, and it is what makes a wrong prediction loud
+            # instead of a silently truncated document (#3989).
+            if full_document_body is not None:
+                assert_append_extends_stored_body(existing_text, full_document_body, document_id=effective_doc_id)
 
     # --- Stale-request check (best-effort, before LLM extraction) ---
     # If the document was already updated by a more recent retain (updated_at > our
@@ -1649,22 +1764,18 @@ async def retain_batch(
 
     # --- Delta retain: check if we can skip unchanged chunks ---
     #
-    # An APPEND is the one shape where `document_body_override` is not the body being written: the
-    # splitter fills it with the incoming item's own text, and the append above then PREPENDS the
-    # stored body onto slice 1 — so the body actually being written is `existing + override`, and
-    # the override alone is only the new tail. Diffing the whole stored document against that tail
-    # classifies every pre-existing chunk as REMOVED and drops it; measured on an oversized append,
-    # chunks ended up covering 4,348 of 18,538 chars. `contents` already carries the prepend, so an
-    # append keeps diffing against that and only slice 1 (the slice holding the prepend) may delta,
-    # exactly as before. `update_mode` is readable on every slice because the splitter copies it
+    # An APPEND still does not diff against `full_document_body`, though no longer because that
+    # value is wrong: the splitter now reports the complete body (stored base + tail) for an append
+    # too, since it is what lands in `documents.original_text` (#3989). It is excluded here because
+    # `contents` ALREADY carries the prepend, so the append diffs against that; handing this in as
+    # well would only duplicate it. What the old behaviour would have done is worth keeping written
+    # down: the override was the tail alone, and diffing the whole stored document against a tail
+    # classifies every pre-existing chunk as REMOVED and drops it — measured on an oversized
+    # append, chunks ended up covering 4,348 of 18,538 chars. Only slice 1 (the one holding the
+    # prepend) may delta; `update_mode` is readable on every slice because the splitter copies it
     # onto each one, so slices 2..N opt out here too rather than re-deleting the body slice 1 wrote.
-    _delta_full_body = document_body_override if update_mode != "append" else None
+    _delta_full_body = full_document_body if update_mode != "append" else None
 
-    # Every slice of an OVERSIZED replacement gets to try, not just the first. Each one diffs the
-    # same complete body against what is stored, so the first slice does the real work and the rest
-    # find nothing left to change and fall through to the metadata-only path. Gating on the first
-    # slice alone left slices 2..N doing a full extraction of their own content regardless, which is
-    # what made an oversized replacement re-extract a document it had just diffed correctly.
     # Delta runs ONLY on the first sub-batch. Widening this to every slice changes the Postgres path
     # too, and three things downstream assume the narrow gate: the caller keeps one result list per
     # sub-batch item (`sub_origins` is length 1 for an oversized slice, so a multi-chunk delta's
@@ -1712,9 +1823,11 @@ async def retain_batch(
             outbox_callback,
             db_semaphore,
             document_prefetch=document_prefetch,
-            document_body_override=document_body_override,
+            full_document_body=full_document_body,
             delta_full_body=_delta_full_body,
             append_base_hash=append_base_hash,
+            attachment_loader=attachment_loader,
+            vlm_config=vlm_config,
         )
         if delta_result is not None:
             return delta_result
@@ -1732,6 +1845,9 @@ async def retain_batch(
     # at different boundaries and makes every stored chunk look changed. Fail loud.
     chunk_size = config.retain_chunk_size
     structured_chunk_size = config.retain_structured_chunk_size
+    # Same reasoning for the image cap: it moves chunk boundaries in exactly the
+    # same way, so it must come from this resolved config too.
+    max_attachments_per_chunk = config.retain_max_attachments_per_chunk
     all_pre_chunks: list[str] = []
     chunk_to_content: list[int] = []  # maps chunk index -> index into contents
     for content_idx, content in enumerate(contents):
@@ -1742,6 +1858,7 @@ async def retain_batch(
             content.content,
             chunk_size,
             structured_chunk_size=structured_chunk_size,
+            max_attachments_per_chunk=max_attachments_per_chunk,
         ):
             all_pre_chunks.append(chunk)
             chunk_to_content.append(content_idx)
@@ -1784,7 +1901,7 @@ async def retain_batch(
         schema=schema,
         outbox_callback=outbox_callback,
         db_semaphore=db_semaphore,
-        document_body_override=document_body_override,
+        full_document_body=full_document_body,
         document_body_hash=document_body_hash,
         chunk_index_offset=chunk_index_offset,
         body_accum=body_accum,
@@ -1794,6 +1911,8 @@ async def retain_batch(
         append_base_hash=append_base_hash,
         append_base_watermark=append_base_watermark,
         force_reextract=force_reextract,
+        attachment_loader=attachment_loader,
+        vlm_config=vlm_config,
     )
 
 
@@ -1922,6 +2041,7 @@ async def _store_document_bodies(
     retain_params: dict | None = None,
     chunk_index_offset: int = 0,
     expect_watermark: int | None = None,
+    attachment_filenames: dict[str, str] | None = None,
 ) -> None:
     """Route a document's bulky bodies — its extracted text and ordered chunk texts — to the
     store's dedicated document store, when the store owns one. No-op for Postgres.
@@ -1937,9 +2057,13 @@ async def _store_document_bodies(
     ``get_document`` returned null ``retain_params`` / ``document_metadata`` /
     ``observation_scopes`` for such a bank. The store's metadata map is ``string -> string``, so
     the params are carried as one JSON value rather than flattened.
+
+    ``attachment_filenames`` rides the same map for the same reason: it is what
+    ``document_attachments.filename`` holds for a SQL bank, and that table needs a SQL
+    ``documents`` row this bank never has.
     """
     from ..memories import get_memories
-    from ..memories.base import StoreWriteConflict
+    from ..memories.base import StoreWriteConflict, document_record_metadata
 
     store = get_memories()
     if not store.store_owned_for(bank_id):
@@ -1979,7 +2103,7 @@ async def _store_document_bodies(
             original_text=combined_content if config.store_document_text else None,
             chunk_texts=list(chunk_texts),
             tags=list(merged_tags or []),
-            metadata=({"retain_params": json.dumps(retain_params)} if retain_params else {}),
+            metadata=document_record_metadata(retain_params, attachment_filenames),
             expect_watermark=expect_watermark,
         )
     except StoreWriteConflict as e:
@@ -2013,6 +2137,7 @@ class DocumentBodyMeta:
     config: Any
     retain_params: dict | None
     expect_watermark: int | None
+    attachment_filenames: dict[str, str] | None = None
 
 
 @dataclasses.dataclass
@@ -2088,6 +2213,7 @@ async def _document_body_write_args(acc: DocumentBodyAccumulator, document_id: s
             merged_tags=meta.merged_tags,
             config=meta.config,
             retain_params=meta.retain_params,
+            attachment_filenames=meta.attachment_filenames,
             # The append CAS belongs to the write derived from the stored base, which is the first
             # one this retain issues; later flushes build on what it wrote.
             expect_watermark=meta.expect_watermark if acc.flushed_bytes == 0 else None,
@@ -2127,6 +2253,7 @@ async def flush_document_bodies(body_accum: dict[str, DocumentBodyAccumulator]) 
     more than the WAL-head contention the batch would avoid.
     """
     from ..memories import get_memories
+    from ..memories.base import document_record_metadata
 
     pending = list(body_accum.items())
     body_accum.clear()
@@ -2167,7 +2294,7 @@ async def flush_document_bodies(body_accum: dict[str, DocumentBodyAccumulator]) 
                     "original_text": (a["combined_content"] if a["config"].store_document_text else None),
                     "chunk_texts": a["chunk_texts"],
                     "tags": list(a["merged_tags"] or []),
-                    "metadata": ({"retain_params": json.dumps(a["retain_params"])} if a["retain_params"] else {}),
+                    "metadata": document_record_metadata(a["retain_params"], a["attachment_filenames"]),
                 }
                 for a in batch
             ],
@@ -2202,7 +2329,7 @@ async def _streaming_retain_batch(
     schema: str | None = None,
     outbox_callback: Callable[["asyncpg.Connection"], Awaitable[None]] | None = None,
     db_semaphore: "asyncio.Semaphore | None" = None,
-    document_body_override: str | None = None,
+    full_document_body: str | None = None,
     document_body_hash: str | None = None,
     chunk_index_offset: int = 0,
     body_accum: "dict[str, DocumentBodyAccumulator] | None" = None,
@@ -2212,6 +2339,8 @@ async def _streaming_retain_batch(
     append_base_hash: str | None = None,
     append_base_watermark: int | None = None,
     force_reextract: bool = False,
+    attachment_loader: "RetainAttachmentLoader | None" = None,
+    vlm_config: "LLMConfig | None" = None,
 ) -> RetainBatchResult:
     """
     Process a large document in streaming mini-batches to bound memory usage.
@@ -2246,14 +2375,14 @@ async def _streaming_retain_batch(
     # the producer can skip already-extracted chunks to avoid duplicate work.
     existing_chunk_hashes: set[str] = set()
     # When the caller is processing a sub-batch sliced out of an oversized
-    # item (see _split_contents_into_sub_batches), document_body_override
+    # item (see _split_contents_into_sub_batches), full_document_body
     # carries the full original document body. Use it for the doc-row write
     # so documents.original_text stores the complete payload, not just this
     # slice (issue #1838).
-    if document_body_override is not None:
+    if full_document_body is not None:
         # Already Memory Defense screened by the caller that produced it
         # (see redact_document_body) — do not rescan it per slice.
-        combined_content = document_body_override
+        combined_content = full_document_body
     else:
         combined_content = "\n".join([c.get("content", "") for c in contents_dicts])
     # Memory: contents_dicts content strings are now captured in combined_content.
@@ -2334,7 +2463,7 @@ async def _streaming_retain_batch(
     # document's chunk texts for the retain and then flush them into a no-op — and worse, it would
     # pin exactly the strings the streaming producer frees as it goes (`all_pre_chunks[i] = ""`).
     from ..memories import get_memories
-    from ..memories.base import RetainDocumentPart
+    from ..memories.base import RetainDocumentPart, document_record_metadata
 
     # A session owns the document body: it carries the chunk texts in the same entry as the facts,
     # so accumulating them here as well would write them twice.
@@ -2352,7 +2481,7 @@ async def _streaming_retain_batch(
                     chunk_texts=list(all_pre_chunks),
                     facts=[],
                     tags=list(merged_tags or []),
-                    metadata=({"retain_params": json.dumps(retain_params)} if retain_params else {}),
+                    metadata=document_record_metadata(retain_params, _attachment_filenames_for(contents)),
                 )
             )
     elif body_accum is not None and effective_doc_id and get_memories().store_owned_for(bank_id):
@@ -2374,6 +2503,7 @@ async def _streaming_retain_batch(
                 config=config,
                 retain_params=retain_params,
                 expect_watermark=append_base_watermark,
+                attachment_filenames=_attachment_filenames_for(contents),
             )
         await _flush_document_body(acc, effective_doc_id, force=False)
     else:
@@ -2386,6 +2516,7 @@ async def _streaming_retain_batch(
             merged_tags=merged_tags,
             config=config,
             retain_params=retain_params,
+            attachment_filenames=_attachment_filenames_for(contents),
             # An append derives the new body from the stored one, so its write is conditional on
             # that base still being current. Only the first sub-batch carries it: it is the one
             # that read the base, and the later sub-batches build on what it just wrote.
@@ -2495,6 +2626,7 @@ async def _streaming_retain_batch(
                 entities=source.entities,
                 resolve_entities=source.resolve_entities,
                 tags=source.tags,
+                attachment_filenames=source.attachment_filenames,
                 observation_scopes=source.observation_scopes,
             )
             # Attribute this chunk's extraction LLM call to its document, so the
@@ -2516,6 +2648,8 @@ async def _streaming_retain_batch(
                     pool,
                     operation_id,
                     schema,
+                    attachment_loader=attachment_loader,
+                    vlm_config=vlm_config,
                 )
             finally:
                 reset_call_metadata(meta_token)
@@ -2773,6 +2907,7 @@ async def _streaming_retain_batch(
                                 retain_params,
                                 merged_tags,
                                 store_document_text=config.store_document_text,
+                                attachment_filenames=_attachment_filenames_for(contents),
                             )
                         else:
                             # A 0-fact re-ingest still deletes the outgoing memories, in the same
@@ -2787,6 +2922,7 @@ async def _streaming_retain_batch(
                                 merged_tags,
                                 ops=pool.ops,
                                 store_document_text=config.store_document_text,
+                                attachment_filenames=_attachment_filenames_for(contents),
                             )
                         doc_tracking_done[0] = True
                         # Memory: combined_content has been persisted; release
@@ -2895,6 +3031,7 @@ async def _streaming_retain_batch(
                         doc_replace_done=doc_replace_done,
                         entity_resolver=entity_resolver,
                         log_buffer=log_buffer,
+                        attachment_filenames=_attachment_filenames_for(contents),
                     )
                 combined_content = ""
                 try:
@@ -2979,6 +3116,7 @@ async def _streaming_retain_batch(
                                 retain_params,
                                 merged_tags,
                                 store_document_text=config.store_document_text,
+                                attachment_filenames=_attachment_filenames_for(contents),
                             )
                             log_buffer.append(
                                 f"[streaming] Document {effective_doc_id} updated "
@@ -2995,6 +3133,7 @@ async def _streaming_retain_batch(
                                 merged_tags,
                                 ops=pool.ops,
                                 store_document_text=config.store_document_text,
+                                attachment_filenames=_attachment_filenames_for(contents),
                             )
                             log_buffer.append(f"[streaming] Document {effective_doc_id} tracked (full content)")
                         doc_tracking_done[0] = True
@@ -3237,6 +3376,7 @@ async def _streaming_retain_batch(
                                 retain_params,
                                 merged_tags,
                                 store_document_text=config.store_document_text,
+                                attachment_filenames=_attachment_filenames_for(contents),
                             )
                         else:
                             # A no-facts re-ingest still deletes the outgoing memories, in the same
@@ -3251,6 +3391,7 @@ async def _streaming_retain_batch(
                                 merged_tags,
                                 ops=pool.ops,
                                 store_document_text=config.store_document_text,
+                                attachment_filenames=_attachment_filenames_for(contents),
                             )
                         doc_tracking_done[0] = True
                         # Memory: combined_content has been persisted and won't be
@@ -3431,11 +3572,15 @@ async def _try_delta_retain(
     db_semaphore: "asyncio.Semaphore | None" = None,
     document_prefetch: "dict[str, dict] | asyncio.Task | None" = None,
     *,
-    document_body_override: str | None = None,
-    # The complete body to diff against, when the caller could establish one. Distinct from
-    # `document_body_override`, which an append fills with only the new tail.
+    full_document_body: str | None = None,
+    # The complete body to DIFF against, when the caller could establish one. None for an append,
+    # whose `contents` already carry the stored body as a prepended item. Distinct from
+    # `full_document_body`, which is what gets WRITTEN — the two are the same for a replacement and
+    # deliberately not for an append.
     delta_full_body: str | None = None,
     append_base_hash: str | None = None,
+    attachment_loader: "RetainAttachmentLoader | None" = None,
+    vlm_config: "LLMConfig | None" = None,
 ) -> RetainBatchResult | None:
     """
     Attempt delta retain for a document upsert. Returns result tuple if delta
@@ -3495,7 +3640,7 @@ async def _try_delta_retain(
         # when no text is wanted: the prefetch deliberately carries no bodies, and an append needs
         # the stored text, so that case still reads its own record. Absent from the prefetch means
         # the document does not exist — which is an answer, not a miss to retry.
-        if document_prefetch is not None and document_body_override is None:
+        if document_prefetch is not None and full_document_body is None:
             # May be the in-flight read rather than its result -- see where it is started. Resolved
             # here, which is the first point that actually needs it.
             if isinstance(document_prefetch, asyncio.Task):
@@ -3505,11 +3650,11 @@ async def _try_delta_retain(
             record = await _delta_store.get_document_record(
                 bank_id=bank_id,
                 document_id=effective_doc_id,
-                include_text=document_body_override is not None,
+                include_text=full_document_body is not None,
             )
         doc_hash_at_load = (record or {}).get("content_hash")
         doc_watermark_at_load = (record or {}).get("watermark")
-        original_text_at_load = (record or {}).get("original_text") if document_body_override is not None else None
+        original_text_at_load = (record or {}).get("original_text") if full_document_body is not None else None
         # The record's own chunk hashes, not a download of every chunk's text. Delta compares
         # hashes; the record already stores them, computed with the same
         # `sha256(chunk.encode()).hexdigest()` that `compute_chunk_hash` uses. Reading the texts
@@ -3517,7 +3662,7 @@ async def _try_delta_retain(
         # arrive at a value the first read already had.
         existing_chunks = [
             chunk_storage.ExistingChunk(
-                chunk_id=f"{bank_id}_{effective_doc_id}_{index}",
+                chunk_id=build_chunk_id(bank_id, effective_doc_id, index),
                 chunk_index=index,
                 content_hash=chunk_hash,
             )
@@ -3526,7 +3671,7 @@ async def _try_delta_retain(
     else:
         doc_watermark_at_load = None  # SQL serializes on the documents row instead
         async with acquire_with_retry(pool) as conn:
-            if document_body_override is not None:
+            if full_document_body is not None:
                 doc_row_at_load = await conn.fetchrow(
                     f"SELECT content_hash, original_text FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2",
                     effective_doc_id,
@@ -3600,9 +3745,15 @@ async def _try_delta_retain(
     )
 
     if not unchanged_indices:
+        # `delta_full_body`, not `full_document_body`: this branch is the OVERSIZED REPLACEMENT
+        # safety valve, and an append must not reach it. An append's `full_document_body` now
+        # carries the complete body (stored base + tail), so it satisfies "strictly appends" by
+        # construction — and taking the metadata-only path here would preserve the historical
+        # chunks while never extracting the tail this append exists to add. `delta_full_body` is
+        # None for an append, which keeps this exactly as reachable as it was.
         if _is_strict_append_of_stored_document(
             original_text_at_load,
-            document_body_override,
+            delta_full_body,
         ):
             log_buffer.append(
                 "[delta] First oversized slice has no stored chunk match, but "
@@ -3619,7 +3770,7 @@ async def _try_delta_retain(
                 log_buffer,
                 start_time,
                 outbox_callback,
-                document_body_override=document_body_override,
+                full_document_body=full_document_body,
                 config=config,
                 expected_content_hash=doc_hash_at_load,
             )
@@ -3641,7 +3792,7 @@ async def _try_delta_retain(
             log_buffer,
             start_time,
             outbox_callback,
-            document_body_override=document_body_override,
+            full_document_body=full_document_body,
             config=config,
             expected_content_hash=doc_hash_at_load,
         )
@@ -3669,7 +3820,7 @@ async def _try_delta_retain(
             log_buffer,
             start_time,
             outbox_callback,
-            document_body_override=document_body_override,
+            full_document_body=full_document_body,
             config=config,
             expected_content_hash=doc_hash_at_load,
         )
@@ -3722,7 +3873,7 @@ async def _try_delta_retain(
                 log_buffer,
                 start_time,
                 outbox_callback,
-                document_body_override=document_body_override,
+                full_document_body=full_document_body,
                 config=config,
                 expected_content_hash=recheck_hash,
             )
@@ -3751,6 +3902,8 @@ async def _try_delta_retain(
             pool,
             operation_id,
             schema,
+            attachment_loader=attachment_loader,
+            vlm_config=vlm_config,
         )
     finally:
         reset_call_metadata(meta_token)
@@ -3799,7 +3952,7 @@ async def _try_delta_retain(
                 contents_dicts=contents_dicts,
                 delta_contents=delta_contents,
                 document_tags=document_tags,
-                document_body_override=document_body_override,
+                full_document_body=full_document_body,
                 extracted_facts=extracted_facts,
                 processed_facts=processed_facts,
                 new_chunk_metadata=new_chunk_metadata,
@@ -3842,8 +3995,8 @@ async def _try_delta_retain(
                 # split across multiple sub-batches, store the full body
                 # (issue #1838) instead of just the slice. The override
                 # arrives already screened (see redact_document_body).
-                if document_body_override is not None:
-                    combined_content = document_body_override
+                if full_document_body is not None:
+                    combined_content = full_document_body
                 else:
                     combined_content = "\n".join([c.get("content", "") for c in contents_dicts])
                 retain_params, merged_tags = _build_retain_params(contents_dicts, document_tags)
@@ -3854,6 +4007,7 @@ async def _try_delta_retain(
                     combined_content,
                     retain_params,
                     merged_tags,
+                    attachment_filenames=_attachment_filenames_for(contents),
                 )
                 # Re-store the document's bodies in the store's document store with the
                 # FULL new chunk set — put_document dedups by content hash, so unchanged chunks and
@@ -3866,6 +4020,7 @@ async def _try_delta_retain(
                     merged_tags=merged_tags,
                     config=config,
                     retain_params=retain_params,
+                    attachment_filenames=_attachment_filenames_for(contents),
                 )
                 log_buffer.append(f"  Document metadata update in {time.time() - step_start:.3f}s")
 
@@ -3897,6 +4052,7 @@ async def _try_delta_retain(
                     merged_tags,
                     retain_params.get("metadata", {}),
                     observation_scopes=retain_params.get("observation_scopes"),
+                    label_tag_keys=label_tag_keys(getattr(config, "entity_labels", None)),
                     ops=pool.ops,
                 )
                 log_buffer.append(
@@ -4010,12 +4166,13 @@ async def _delta_metadata_only(
     start_time,
     outbox_callback,
     *,
-    document_body_override: str | None = None,
+    full_document_body: str | None = None,
     config: Any = None,
     expected_content_hash: str | None = None,
 ) -> RetainBatchResult | None:
     """Handle the case where no chunks changed — just update document metadata and tags."""
     from ..memories import get_memories as _get_memories_meta
+    from ..memories.base import document_record_metadata
 
     _meta_store = _get_memories_meta()
     if _meta_store.store_owned_for(bank_id):
@@ -4030,8 +4187,8 @@ async def _delta_metadata_only(
             )
             return None
         combined_content = (
-            document_body_override
-            if document_body_override is not None
+            full_document_body
+            if full_document_body is not None
             else "\n".join([c.get("content", "") for c in contents_dicts])
         )
         retain_params, merged_tags = _build_retain_params(contents_dicts, document_tags)
@@ -4045,7 +4202,11 @@ async def _delta_metadata_only(
             original_text=combined_content,
             chunk_texts=chunk_texts,
             tags=merged_tags,
-            metadata=retain_params,
+            # The same map every other write path produces. This path used to pass the params dict
+            # itself, which the store flattened key by key: the record then carried no
+            # `retain_params` entry, and a metadata-only re-retain blanked what get_document and
+            # reprocess read back.
+            metadata=document_record_metadata(retain_params, _attachment_filenames_for(contents)),
         )
         # The document record now carries the new labels, but the memories do not: the SQL branch
         # below propagates them onto the units with the same call, and without it a tags-only
@@ -4065,6 +4226,7 @@ async def _delta_metadata_only(
                     merged_tags,
                     retain_params.get("metadata", {}),
                     observation_scopes=retain_params.get("observation_scopes"),
+                    label_tag_keys=label_tag_keys(getattr(config, "entity_labels", None)),
                     ops=pool.ops,
                 )
         if outbox_callback is not None:
@@ -4092,8 +4254,8 @@ async def _delta_metadata_only(
             # When this sub-batch is a slice of an oversized item, write the
             # full original body (issue #1838) instead of just the slice. The
             # override arrives already screened (see redact_document_body).
-            if document_body_override is not None:
-                combined_content = document_body_override
+            if full_document_body is not None:
+                combined_content = full_document_body
             else:
                 combined_content = "\n".join([c.get("content", "") for c in contents_dicts])
             retain_params, merged_tags = _build_retain_params(contents_dicts, document_tags)
@@ -4104,6 +4266,7 @@ async def _delta_metadata_only(
                 combined_content,
                 retain_params,
                 merged_tags,
+                attachment_filenames=_attachment_filenames_for(contents),
             )
             await fact_storage.update_memory_units_metadata_and_tags(
                 conn,
@@ -4112,6 +4275,7 @@ async def _delta_metadata_only(
                 merged_tags,
                 retain_params.get("metadata", {}),
                 observation_scopes=retain_params.get("observation_scopes"),
+                label_tag_keys=label_tag_keys(getattr(config, "entity_labels", None)),
                 ops=pool.ops,
             )
             if outbox_callback is not None:
@@ -4154,6 +4318,7 @@ def _build_contents(contents_dicts: list[RetainContentDict], document_tags: list
             entities=item.get("entities", []),
             resolve_entities=item.get("resolve_entities", True),
             tags=merged_tags,
+            attachment_filenames=item.get("attachment_filenames") or {},
             observation_scopes=item.get("observation_scopes"),
         )
         contents.append(content)
@@ -4181,6 +4346,7 @@ def _chunk_contents_for_delta(contents: list[RetainContent], config) -> dict[int
             content.content,
             chunk_size,
             structured_chunk_size=structured_chunk_size,
+            max_attachments_per_chunk=config.retain_max_attachments_per_chunk,
         )
         for chunk_text in chunks:
             result[global_chunk_idx] = chunk_text

@@ -429,6 +429,9 @@ class PostgresMemories(MemoriesExtension):
     ) -> dict[str, bool]:
         return await reads.any_memory_updated_since_batch(conn=conn, fq_table=fq_table, bank_id=bank_id, scopes=scopes)
 
+    async def latest_memory_write_at(self, *, conn, fq_table, bank_id: str) -> datetime | None:
+        return await reads.latest_memory_write_at(conn=conn, fq_table=fq_table, bank_id=bank_id)
+
     async def live_memory_ids(self, *, conn, fq_table, bank_id: str, unit_ids: list[Any]) -> set[str]:
         return await reads.live_memory_ids(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=unit_ids)
 
@@ -452,8 +455,12 @@ class PostgresMemories(MemoriesExtension):
             conn=conn, fq_table=fq_table, bank_id=bank_id, time_field=time_field, trunc=trunc, since=since
         )
 
-    async def observation_scope_counts(self, *, conn, fq_table, bank_id: str) -> list[dict[str, Any]]:
-        return await counts.observation_scope_counts(conn=conn, fq_table=fq_table, bank_id=bank_id)
+    async def observation_scope_counts(
+        self, *, conn, fq_table, bank_id: str, limit: int = 100, offset: int = 0
+    ) -> dict[str, Any]:
+        return await counts.observation_scope_counts(
+            conn=conn, fq_table=fq_table, bank_id=bank_id, limit=limit, offset=offset
+        )
 
     # ------------------------------------------------------------------ observations
 
