@@ -1,8 +1,8 @@
 ---
 title: "Onboarding an Engineer vs. Onboarding an Agent"
 authors: [benfrank241]
-slug: "2026/09/04/onboarding-engineer-vs-agent"
-date: 2026-09-04T14:00
+slug: "2026/09/14/onboarding-engineer-vs-agent"
+date: 2026-09-14T12:00
 tags: [agent-memory, onboarding, coding-agents, engineering-culture, knowledge]
 description: "You already know how to get a new engineer productive: docs, pairing, and time. Agents need the same thing and get none of it, because every session is their first day."
 image: /img/blog/onboarding-engineer-vs-agent.png
