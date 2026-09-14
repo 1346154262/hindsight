@@ -142,6 +142,10 @@ DOC_META_RETAIN_PARAMS = "retain_params"
 #: not the bytes: the same image can be "diagram.png" in one document and "fig-2.png" in another.
 #: It is what `document_attachments.filename` holds for a bank whose documents live in SQL.
 DOC_META_ATTACHMENT_FILENAMES = "attachment_filenames"
+#: Where the document's original upload lives in Hindsight's ``file_storage`` — the key
+#: ``documents.file_storage_key`` holds for a bank whose documents live in SQL. The upload's name
+#: and content type ride on the record's own ``file_original_name`` / ``file_content_type``.
+DOC_META_FILE_STORAGE_KEY = "file_storage_key"
 CONSOLIDATED_NO = "0"
 CONSOLIDATED_YES = "1"
 
@@ -182,6 +186,24 @@ def document_attachment_filenames(record: "Mapping | None") -> dict[str, str]:
     if not isinstance(decoded, dict):
         return {}
     return {str(k): str(v) for k, v in decoded.items() if k and v}
+
+
+def document_file_reference(record: "Mapping | None") -> "dict[str, str] | None":
+    """The uploaded file a store-owned document was converted from, or ``None``.
+
+    The same three values ``documents.file_storage_key`` / ``file_original_name`` /
+    ``file_content_type`` hold for a bank whose documents live in SQL, read off the record
+    :meth:`MemoriesExtension.set_document_file` wrote. A record with no storage key has no file:
+    the name and type alone point at nothing.
+    """
+    key = ((record or {}).get("metadata") or {}).get(DOC_META_FILE_STORAGE_KEY)
+    if not key:
+        return None
+    return {
+        "file_storage_key": str(key),
+        "file_original_name": str((record or {}).get("file_original_name") or ""),
+        "file_content_type": str((record or {}).get("file_content_type") or ""),
+    }
 
 
 #: Prefix for the per-source metadata key an observation carries, one per source.
@@ -1280,6 +1302,29 @@ class MemoriesExtension(Extension, ABC):
         Without it, `update_document(tags=...)` changed the memories' tags and left the document
         itself showing the old ones, which is the sort of half-applied edit that only surfaces in
         the browser a week later."""
+        raise NotImplementedError
+
+    async def set_document_file(
+        self,
+        *,
+        bank_id: str,
+        document_id: str,
+        storage_key: str,
+        original_name: str,
+        content_type: str,
+    ) -> bool:
+        """Record on a document RECORD the uploaded file it was converted from, leaving its bodies
+        alone. Returns ``False`` when the document does not exist.
+
+        Only a ``store_owned`` store implements this; a Postgres store keeps the reference on its
+        own ``documents`` row, so the engine calls it only for a store-owned bank. It is a separate
+        write because a file-convert retain learns the reference in its own task, after the retain
+        that wrote the record; without it the reference had nowhere to go and was silently dropped.
+
+        The storage key is a pointer into Hindsight's ``file_storage``, not bytes the store holds —
+        :func:`document_file_reference` reads the three values back. A later write that replaces the
+        document's content replaces the record, and with it the reference: the new content was not
+        converted from that file."""
         raise NotImplementedError
 
     async def delete_document_record(self, *, bank_id: str, document_id: str) -> None:
