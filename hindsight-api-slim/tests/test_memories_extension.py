@@ -30,6 +30,7 @@ import pytest
 
 from hindsight_api.engine.memories import create_memories, get_memories, set_memories
 from hindsight_api.engine.memories.base import (
+    DOC_META_FILE_STORAGE_KEY,
     EntityPrunePassResult,
     MemoriesExtension,
     RecallArms,
@@ -117,7 +118,7 @@ class InMemoryMemories(MemoriesExtension):
         doc = self.documents.get(str(document_id))
         if doc is None:
             return False
-        doc["metadata"]["file_storage_key"] = storage_key
+        doc["metadata"][DOC_META_FILE_STORAGE_KEY] = storage_key
         doc["file_original_name"] = original_name
         doc["file_content_type"] = content_type
         return True
@@ -1301,9 +1302,7 @@ async def test_store_document_bodies_omits_absent_retain_params(restore_default_
 async def test_file_convert_retain_records_the_upload_on_the_store_record(memory, restore_default_store):
     """A store-owned bank has no SQL `documents` row, so the file-metadata UPDATE after a
     file-convert retain matched nothing and the reference to the upload was silently dropped.
-    It must land on the store's record, where `document_file_reference` reads it back."""
-    from hindsight_api.engine.memories.base import document_file_reference
-
+    It must land on the store's record."""
     store = InMemoryMemories({})
     set_memories(store)
     suffix = uuid.uuid4().hex[:8]
@@ -1330,20 +1329,9 @@ async def test_file_convert_retain_records_the_upload_on_the_store_record(memory
     )
 
     record = await store.get_document_record(bank_id=bank_id, document_id=doc_id)
-    assert document_file_reference(record) == {
-        "file_storage_key": f"banks/{bank_id}/files/report.pdf",
-        "file_original_name": "report.pdf",
-        "file_content_type": "application/pdf",
-    }
-
-
-def test_a_record_without_a_storage_key_has_no_file():
-    """The name and type alone point at nothing; a record written before the key existed reads
-    back as "no file", not as an error."""
-    from hindsight_api.engine.memories.base import document_file_reference
-
-    assert document_file_reference(None) is None
-    assert document_file_reference({"metadata": {}, "file_original_name": "x.pdf"}) is None
+    assert record["metadata"][DOC_META_FILE_STORAGE_KEY] == f"banks/{bank_id}/files/report.pdf"
+    assert record["file_original_name"] == "report.pdf"
+    assert record["file_content_type"] == "application/pdf"
 
 
 async def test_recall_include_chunks_hydrates_body_from_store(memory, request_context, restore_default_store):

@@ -188,24 +188,6 @@ def document_attachment_filenames(record: "Mapping | None") -> dict[str, str]:
     return {str(k): str(v) for k, v in decoded.items() if k and v}
 
 
-def document_file_reference(record: "Mapping | None") -> "dict[str, str] | None":
-    """The uploaded file a store-owned document was converted from, or ``None``.
-
-    The same three values ``documents.file_storage_key`` / ``file_original_name`` /
-    ``file_content_type`` hold for a bank whose documents live in SQL, read off the record
-    :meth:`MemoriesExtension.set_document_file` wrote. A record with no storage key has no file:
-    the name and type alone point at nothing.
-    """
-    key = ((record or {}).get("metadata") or {}).get(DOC_META_FILE_STORAGE_KEY)
-    if not key:
-        return None
-    return {
-        "file_storage_key": str(key),
-        "file_original_name": str((record or {}).get("file_original_name") or ""),
-        "file_content_type": str((record or {}).get("file_content_type") or ""),
-    }
-
-
 #: Prefix for the per-source metadata key an observation carries, one per source.
 #: The forward list (:data:`META_SOURCE_MEMORY_IDS`) reads an observation's
 #: sources; these read the other direction — "observations built on this fact" —
@@ -1321,8 +1303,8 @@ class MemoriesExtension(Extension, ABC):
         write because a file-convert retain learns the reference in its own task, after the retain
         that wrote the record; without it the reference had nowhere to go and was silently dropped.
 
-        The storage key is a pointer into Hindsight's ``file_storage``, not bytes the store holds —
-        :func:`document_file_reference` reads the three values back. A later write that replaces the
+        The storage key is a pointer into Hindsight's ``file_storage``, not bytes the store holds; it
+        goes in the record's metadata under :data:`DOC_META_FILE_STORAGE_KEY`. A later write that replaces the
         document's content replaces the record, and with it the reference: the new content was not
         converted from that file."""
         raise NotImplementedError
