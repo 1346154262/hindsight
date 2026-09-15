@@ -504,6 +504,7 @@ class TestPortPreflight:
             port = listener.getsockname()[1]
             monkeypatch.setattr(sys, "argv", ["hindsight-api", "--host", "127.0.0.1", "--port", str(port), *flags])
             with (
+                patch("hindsight_api.main._PORT_IN_USE_GRACE_SECONDS", 0),
                 patch("hindsight_api.main.load_dotenv_for_entrypoint"),
                 patch("hindsight_api.main.daemonize") as mock_daemonize,
                 patch("hindsight_api.main.MemoryEngine") as mock_engine,
@@ -525,6 +526,44 @@ class TestPortPreflight:
             with socket.create_connection(("127.0.0.1", port), timeout=1):
                 conn, _ = listener.accept()
                 conn.close()
+
+    def test_port_released_within_grace_is_not_an_error(self):
+        """A previous instance still releasing the port must not make startup fail."""
+        from hindsight_api.main import _wait_for_port
+
+        # side_effect would RAISE exception instances, so hand them back through a function.
+        results = iter([OSError(errno.EADDRINUSE, "Address already in use")] * 2 + [None])
+        with (
+            patch("hindsight_api.main._port_bind_error", side_effect=lambda host, port: next(results)) as probe,
+            patch("hindsight_api.main.time.sleep") as sleep,
+        ):
+            assert _wait_for_port("127.0.0.1", 9177) is None
+        assert probe.call_count == 3
+        assert sleep.call_count == 2
+
+    def test_port_still_in_use_after_grace_fails(self):
+        from hindsight_api.main import _wait_for_port
+
+        with (
+            socket.create_server(("127.0.0.1", 0)) as listener,
+            patch("hindsight_api.main._PORT_IN_USE_GRACE_SECONDS", 0.3),
+            patch("hindsight_api.main._PORT_IN_USE_RETRY_INTERVAL", 0.05),
+        ):
+            error = _wait_for_port("127.0.0.1", listener.getsockname()[1])
+        assert isinstance(error, OSError)
+        assert error.errno == errno.EADDRINUSE
+
+    def test_other_bind_errors_are_not_retried(self):
+        from hindsight_api.main import _wait_for_port
+
+        denied = OSError(errno.EACCES, "Permission denied")
+        with (
+            patch("hindsight_api.main._port_bind_error", return_value=denied) as probe,
+            patch("hindsight_api.main.time.sleep") as sleep,
+        ):
+            assert _wait_for_port("127.0.0.1", 80) is denied
+        assert probe.call_count == 1
+        sleep.assert_not_called()
 
     def test_bind_error_reports_the_occupied_port(self):
         from hindsight_api.main import _port_bind_error

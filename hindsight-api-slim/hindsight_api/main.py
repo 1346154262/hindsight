@@ -14,10 +14,12 @@ import argparse
 import asyncio
 import atexit
 import dataclasses
+import errno
 import os
 import signal
 import socket
 import sys
+import time
 import warnings
 
 import uvicorn
@@ -155,6 +157,26 @@ def _port_bind_error(host: str, port: int) -> OSError | None:
         except OSError as exc:
             return exc
     return None
+
+
+# How long an "address in use" is retried before giving up. Before the pre-flight probe, the
+# ~10s of initialization ahead of uvicorn's bind silently absorbed a previous instance that was
+# still releasing the port (a restart that doesn't wait for the old process to exit); failing on
+# the first attempt would turn that into a spurious exit. Matches uvicorn's graceful-shutdown cap.
+_PORT_IN_USE_GRACE_SECONDS = 5.0
+_PORT_IN_USE_RETRY_INTERVAL = 0.5
+# Windows reports WSAEADDRINUSE (10048) rather than errno.EADDRINUSE.
+_ADDR_IN_USE_ERRNOS = {errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", errno.EADDRINUSE)}
+
+
+def _wait_for_port(host: str, port: int) -> OSError | None:
+    """Probe the bind, retrying "address in use" for a short grace window; return the final error."""
+    deadline = time.monotonic() + _PORT_IN_USE_GRACE_SECONDS
+    error = _port_bind_error(host, port)
+    while error is not None and error.errno in _ADDR_IN_USE_ERRNOS and time.monotonic() < deadline:
+        time.sleep(_PORT_IN_USE_RETRY_INTERVAL)
+        error = _port_bind_error(host, port)
+    return error
 
 
 @dataclasses.dataclass(frozen=True)
@@ -300,7 +322,7 @@ def main():
 
     # Fail before any expensive initialization if the port cannot be bound. For --daemon this
     # runs in the foreground parent too, so the error reaches the terminal instead of the log.
-    bind_error = _port_bind_error(args.host, args.port)
+    bind_error = _wait_for_port(args.host, args.port)
     if bind_error is not None:
         print(f"Error: cannot bind {args.host}:{args.port}: {bind_error}", file=sys.stderr)
         sys.exit(1)
