@@ -20,6 +20,7 @@ from hindsight_api.extensions import (
     BankReadOperation,
     BankWriteOperation,
     OperationValidationError,
+    OperationValidatorExtension,
     ValidationResult,
 )
 from hindsight_api.models import RequestContext
@@ -1462,6 +1463,49 @@ async def test_recall_returns_404_for_a_bank_that_was_never_created(api_client):
     )
     assert response.status_code == 404, response.text
     assert response.json()["detail"] == f"Bank '{bank_id}' not found"
+
+
+class _BankScopeRecallValidator(OperationValidatorExtension):
+    """Models a bank-scoped API key: recall is allowed only on ``allowed_bank``, 403 elsewhere."""
+
+    allowed_bank = "scoped-allowed-bank"
+
+    async def precheck(self, ctx):
+        return ValidationResult.accept()
+
+    async def validate_retain(self, ctx):
+        return ValidationResult.accept()
+
+    async def validate_recall(self, ctx):
+        if ctx.bank_id != self.allowed_bank:
+            return ValidationResult.reject("bank not allowed for this key", status_code=403)
+        return ValidationResult.accept()
+
+    async def validate_reflect(self, ctx):
+        return ValidationResult.accept()
+
+
+@pytest.mark.asyncio
+async def test_recall_of_disallowed_bank_is_403_not_404_even_when_missing(api_client, memory):
+    """A bank-scoped key recalling a bank outside its scope must get 403, even when that bank was
+    never created.
+
+    ``_require_bank_exists`` runs AFTER ``validate_recall`` on purpose: if the existence guard ran
+    first, a restricted key would get 404 for a missing out-of-scope bank and 403 for an existing
+    one, turning the guard into an existence oracle across the authorization boundary. The
+    validator (403) must win over the existence check (404).
+    """
+    previous = getattr(memory, "_operation_validator", None)
+    memory._operation_validator = _BankScopeRecallValidator({})
+    try:
+        # The bank is BOTH out-of-scope for the key AND never created — authz must decide it.
+        response = await api_client.post(
+            "/v1/default/banks/never-created-and-disallowed/memories/recall",
+            json={"query": "anything at all"},
+        )
+        assert response.status_code == 403, response.text
+    finally:
+        memory._operation_validator = previous
 
 
 @pytest.mark.asyncio

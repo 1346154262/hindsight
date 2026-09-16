@@ -7771,15 +7771,6 @@ class MemoryEngine(MemoryEngineInterface):
         # inside _search_with_retries.
         request_context.raise_if_cancelled()
 
-        # Bank-existence guard, the same one every other bank-scoped read carries (see
-        # _require_bank_exists): recall of a bank nobody created is a 404, not a 200 with empty
-        # results. recall is the endpoint most likely to be polled in a loop, so a typo'd, renamed
-        # or deleted bank_id returning "healthy empty bank" is exactly the silent pass #4175 ruled
-        # out. It also declines before the retrieval fan-out — dense + BM25 + a graph arm per
-        # fact_type, each taking a pool connection — runs against a bank that holds nothing. The
-        # profile row is process-cached, so an existing bank pays no extra query.
-        await self._require_bank_exists(bank_id)
-
         # Sanitize the query at ingress: a client may serialize a half-emoji as a
         # lone UTF-16 surrogate, which crashes downstream logging, the embedder, and
         # the cross-encoder tokenizer with an HTTP 500 (see issue #1875). Cleaning it
@@ -7855,6 +7846,18 @@ class MemoryEngine(MemoryEngineInterface):
                     tags_match = result.tags_match
                 if result.tag_groups is not None:
                     tag_groups = result.tag_groups
+
+        # Bank-existence guard, the same one every other bank-scoped read carries (see
+        # _require_bank_exists): recall of a bank nobody created is a 404, not a 200 with empty
+        # results. recall is the endpoint most likely to be polled in a loop, so a typo'd, renamed
+        # or deleted bank_id returning "healthy empty bank" is exactly the silent pass #4175 ruled
+        # out. Placed AFTER validate_recall on purpose: a bank-scoped key hitting a bank outside its
+        # allowed_bank_ids must get 403 from the validator FIRST, so the 404 never becomes an
+        # existence oracle across the authorization boundary (a restricted key must not be able to
+        # tell an out-of-scope bank that exists from one that does not). It still declines before
+        # the retrieval fan-out — dense + BM25 + a graph arm per fact_type, each taking a pool
+        # connection — and the profile row is process-cached, so an existing bank pays no extra query.
+        await self._require_bank_exists(bank_id)
 
         # Resolve fuzzy tag tokens into real tags before anything builds SQL. Runs after
         # the validator so a validator-supplied tag_groups is resolved too.
