@@ -84,6 +84,30 @@ A recall response carries attachment data in two places, and they deliberately d
 
 Rendering the source document? Use the chunk set. Showing a user why the agent believes something? Use the fact set, because the chunk set would overstate your evidence. When there's nothing to report, the field is omitted rather than returned empty.
 
+## Getting the image back
+
+A recall result doesn't carry bytes. It carries a reference:
+
+```json
+{
+  "id": "8f41c2ad9e6b",
+  "hash": "8f41c2ad9e6b47f0...",
+  "kind": "image",
+  "media_type": "image/png",
+  "byte_size": 68344,
+  "filename": "error-screenshot.png",
+  "url": "/v1/default/banks/acme-support/attachments/8f41c2ad9e6b"
+}
+```
+
+`GET` that path and you get the bytes under the Content-Type the caller declared at retain. It's authorized against the bank, so the same credentials your recall used. A missing attachment and a bank you can't see both return 404, so the endpoint can't be used to probe what a bank holds. Because the id is derived from the content hash, the bytes at a URL can never change, and they're served cacheable indefinitely.
+
+That reference is enough for either of the two things you'd want to do with it.
+
+**Show it as a citation.** You have `media_type`, `byte_size` and the original `filename` before fetching anything, so you can render a thumbnail next to the answer, or a download link for a PDF, and only pull the bytes when someone asks to see it.
+
+**Feed it back to a model.** Fetch the bytes, base64 them, and send them as an image block in your next prompt: the same shape you retained it with. The agent that recalls "the error was a dimension mismatch" can put the original screenshot back in front of a vision model and ask it something new.
+
 ## Where it refuses
 
 Most of the interesting engineering here is in the failure paths.
