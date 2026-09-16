@@ -1400,6 +1400,24 @@ async def test_http_recall_preserves_metadata(api_client, test_bank_id):
 
 
 @pytest.mark.asyncio
+async def test_recall_returns_404_for_a_bank_that_was_never_created(api_client):
+    """recall is a bank-scoped read: a bank nobody created is a 404, not a 200 with empty results.
+
+    Every other bank-scoped read (`/stats`, `/memories/list`, the document / chunk / mental-model
+    reads) already guards this via `_require_bank_exists` (#4175). recall is the endpoint most
+    likely to be polled in a loop, so a typo'd, renamed or deleted bank id must not come back
+    looking like a healthy empty bank — and the retrieval fan-out must not run for it at all.
+    """
+    bank_id = f"never_created_{datetime.now().timestamp()}"
+    response = await api_client.post(
+        f"/v1/default/banks/{bank_id}/memories/recall",
+        json={"query": "anything at all"},
+    )
+    assert response.status_code == 404, response.text
+    assert response.json()["detail"] == f"Bank '{bank_id}' not found"
+
+
+@pytest.mark.asyncio
 async def test_unknown_params_not_rejected(api_client):
     """Unknown query params and body fields should not cause a rejection (no 400).
 
