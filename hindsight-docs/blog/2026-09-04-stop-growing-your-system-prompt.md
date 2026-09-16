@@ -1,5 +1,5 @@
 ---
-title: "Stop Growing Your System Prompt"
+title: "Stop Growing Your Always-On Context"
 authors: [benfrank241]
 slug: "2026/09/04/stop-growing-your-system-prompt"
 date: 2026-09-04T13:00
@@ -9,9 +9,9 @@ image: /img/blog/stop-growing-your-system-prompt.png
 hide_table_of_contents: true
 ---
 
-![Stop growing your system prompt: unconditional context costs every turn and gets less relevant as it grows](/img/blog/stop-growing-your-system-prompt.png)
+![Stop growing your always-on context: unconditional context costs every turn and gets less relevant as it grows](/img/blog/stop-growing-your-system-prompt.png)
 
-Every agent starts with a small system prompt. Then it gets something wrong, and you add a line. Then it gets something else wrong, and you add a paragraph. Six weeks later the prompt is two thousand tokens of accumulated correction, nobody remembers why half of it is there, and deleting any of it feels risky.
+Every agent starts with a small system prompt, though these days it's more often a `CLAUDE.md` or an `AGENTS.md` than a string in your code. Call the whole thing the always-on context: the instructions your agent reads on every single turn, wherever they physically live. Then it gets something wrong, and you add a line. Then it gets something else wrong, and you add a paragraph. Six weeks later the prompt is two thousand tokens of accumulated correction, nobody remembers why half of it is there, and deleting any of it feels risky.
 
 This is the most natural thing in the world to do, and for a while it's genuinely the right move. The question is what happens after that.
 
@@ -38,6 +38,20 @@ Two thousand tokens of accumulated instruction gets sent when the user asks you 
 **It crowds out the actual task.** Context is finite even when it's large, and everything spent on standing instruction is unavailable to the thing you're doing right now. In a long session, prompt bloat is competing directly with the code the agent needs to read.
 
 **Relevance falls as size grows.** A model attending to twenty highly relevant lines behaves differently than one attending to two hundred lines of which twenty apply. You haven't just added noise around the signal; you've made the signal proportionally smaller. Adding a rule can genuinely make an existing rule less likely to be followed, which is a maddening thing to debug because the line you added is fine and the line that broke is untouched.
+
+## But my harness already handles this
+
+The tooling has moved since the worst version of this problem. Standing context now lives in files rather than a string, scoped per project and sometimes per directory. Prompt caching means a stable prefix isn't billed at full rate on every turn. Harnesses compact long sessions automatically, hand work to subagents with their own windows, and load some instructions only when they look relevant.
+
+All of that is real, and it genuinely changes the economics. It doesn't change the shape of the problem.
+
+**Caching cuts the price, not the crowding.** On Anthropic's API, a cached prefix reads at roughly a tenth of the normal input rate; writing the cache costs about 25% more, and the default entry lives five minutes. That's a large saving on the least interesting of the three costs. The tokens still occupy the window, the model still attends to them, and a rule buried in two thousand tokens of standing instruction is no easier to follow for having been cheap to send.
+
+**Rules files ratchet harder than prompts did.** A prompt in a Python string had one author. A file in version control has everyone, with the same asymmetry: adding is a one-line PR that nobody objects to, deleting requires proving a line is obsolete. Directory scoping genuinely helps, because a file that loads only inside `services/api` is conditional context and that's the right instinct. Most of what accumulates is project-wide anyway.
+
+**Compaction manages the symptom.** Automatic summarization is what happens once the window is already full. It's lossy, it favours recent turns, and it fires in the middle of long tasks, which is exactly when losing earlier detail costs the most. It decides what to throw away after the fact; it doesn't decide what deserved to be resident in the first place.
+
+**Progressive disclosure is retrieval wearing a different hat.** When a harness loads a skill or a scoped rules file only when it looks relevant, it has stopped putting that knowledge in the prompt and started retrieving it. That's this argument, already conceded and shipped. The open question is what happens to the knowledge your harness doesn't manage for you: what your team decided, what you tried, and why.
 
 ## It only ever grows
 
