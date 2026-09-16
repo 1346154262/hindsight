@@ -1,8 +1,8 @@
 ---
 title: "Stop Growing Your Always-On Context"
 authors: [benfrank241]
-slug: "2026/09/04/stop-growing-your-system-prompt"
-date: 2026-09-04T13:00
+slug: "2026/09/16/stop-growing-your-system-prompt"
+date: 2026-09-16T13:00
 tags: [agent-memory, context, system-prompt, retrieval, rag, agents]
 description: "The default fix for an agent that forgets is to put more in the prompt. It works until it doesn't, and the way it fails is quiet: unconditional context that costs every turn and gets less relevant as it grows."
 image: /img/blog/stop-growing-your-system-prompt.png
