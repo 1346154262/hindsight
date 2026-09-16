@@ -304,7 +304,7 @@ async def test_backup_restore_roundtrip(backup_test_schema):
 
         # Create some test memory units with embeddings
         # Convert embedding list to pgvector format string
-        embedding_list = embeddings.encode(["Test content about Alice"])[0]
+        embedding_list = (await embeddings.encode(["Test content about Alice"]))[0]
         embedding_str = "[" + ",".join(str(x) for x in embedding_list) + "]"
         for text in [
             "Alice is a software engineer who loves Python.",
@@ -480,7 +480,7 @@ async def test_backup_restore_preserves_all_column_types(backup_test_schema):
 
         # Create a memory unit with all column types
         # Convert embedding list to pgvector format string
-        embedding_list = embeddings.encode(["John Smith engineer"])[0]
+        embedding_list = (await embeddings.encode(["John Smith engineer"]))[0]
         embedding_str = "[" + ",".join(str(x) for x in embedding_list) + "]"
         await conn.execute(
             f"""INSERT INTO {_fq("memory_units")}
@@ -813,9 +813,7 @@ async def test_run_migration_without_schema_discovers_and_deduplicates_schemas(m
     # See migrations._should_isolate_migrations.
     # Patched rather than set via HINDSIGHT_API_MIGRATION_ISOLATION: the flag is read
     # through get_config(), whose result is cached in a module global, so setting the
-    # env var after any earlier get_config() call has no effect. That goes unnoticed on
-    # 3.11, where "auto" resolves to no-isolation anyway, and fails on a free-threaded
-    # build where "auto" isolates and these patches are never reached.
+    # env var after any earlier get_config() call has no effect.
     monkeypatch.setattr(migrations, "_should_isolate_migrations", lambda: False)
     calls: dict[str, list] = {
         "run_migrations": [],
@@ -841,6 +839,7 @@ async def test_run_migration_without_schema_discovers_and_deduplicates_schemas(m
         database_url: str,
         vector_extension: str = "pgvector",
         schema: str | None = None,
+        store_owned_memories: bool = False,
     ) -> None:
         calls["ensure_vector_extension"].append((database_url, vector_extension, schema))
 
@@ -849,6 +848,7 @@ async def test_run_migration_without_schema_discovers_and_deduplicates_schemas(m
         text_search_extension: str = "native",
         schema: str | None = None,
         pg_search_tokenizer: str | None = None,
+        store_owned_memories: bool = False,
     ) -> None:
         calls["ensure_text_search_extension"].append((database_url, text_search_extension, pg_search_tokenizer, schema))
 
@@ -889,9 +889,7 @@ async def test_run_migration_without_schema_runs_optional_post_migration_hooks(m
     # See migrations._should_isolate_migrations.
     # Patched rather than set via HINDSIGHT_API_MIGRATION_ISOLATION: the flag is read
     # through get_config(), whose result is cached in a module global, so setting the
-    # env var after any earlier get_config() call has no effect. That goes unnoticed on
-    # 3.11, where "auto" resolves to no-isolation anyway, and fails on a free-threaded
-    # build where "auto" isolates and these patches are never reached.
+    # env var after any earlier get_config() call has no effect.
     monkeypatch.setattr(migrations, "_should_isolate_migrations", lambda: False)
     monkeypatch.setenv("HINDSIGHT_API_DATABASE_URL", "postgresql://test")
     calls: dict[str, list] = {
@@ -916,6 +914,7 @@ async def test_run_migration_without_schema_runs_optional_post_migration_hooks(m
         dimension: int,
         schema: str | None = None,
         vector_extension: str = "pgvector",
+        store_owned_memories: bool = False,
     ) -> None:
         calls["ensure_embedding_dimension"].append((database_url, dimension, schema, vector_extension))
 
@@ -923,6 +922,7 @@ async def test_run_migration_without_schema_runs_optional_post_migration_hooks(m
         database_url: str,
         vector_extension: str = "pgvector",
         schema: str | None = None,
+        store_owned_memories: bool = False,
     ) -> None:
         calls["ensure_vector_extension"].append((database_url, vector_extension, schema))
 
@@ -931,6 +931,7 @@ async def test_run_migration_without_schema_runs_optional_post_migration_hooks(m
         text_search_extension: str = "native",
         schema: str | None = None,
         pg_search_tokenizer: str | None = None,
+        store_owned_memories: bool = False,
     ) -> None:
         calls["ensure_text_search_extension"].append((database_url, text_search_extension, pg_search_tokenizer, schema))
 
@@ -979,9 +980,7 @@ async def test_run_migration_with_schema_only_runs_requested_schema(monkeypatch)
     # See migrations._should_isolate_migrations.
     # Patched rather than set via HINDSIGHT_API_MIGRATION_ISOLATION: the flag is read
     # through get_config(), whose result is cached in a module global, so setting the
-    # env var after any earlier get_config() call has no effect. That goes unnoticed on
-    # 3.11, where "auto" resolves to no-isolation anyway, and fails on a free-threaded
-    # build where "auto" isolates and these patches are never reached.
+    # env var after any earlier get_config() call has no effect.
     monkeypatch.setattr(migrations, "_should_isolate_migrations", lambda: False)
     monkeypatch.setenv("HINDSIGHT_API_DATABASE_URL", "postgresql://test")
     calls: dict[str, list] = {
@@ -1004,6 +1003,7 @@ async def test_run_migration_with_schema_only_runs_requested_schema(monkeypatch)
         database_url: str,
         vector_extension: str = "pgvector",
         schema: str | None = None,
+        store_owned_memories: bool = False,
     ) -> None:
         calls["ensure_vector_extension"].append((database_url, vector_extension, schema))
 
@@ -1012,6 +1012,7 @@ async def test_run_migration_with_schema_only_runs_requested_schema(monkeypatch)
         text_search_extension: str = "native",
         schema: str | None = None,
         pg_search_tokenizer: str | None = None,
+        store_owned_memories: bool = False,
     ) -> None:
         calls["ensure_text_search_extension"].append((database_url, text_search_extension, pg_search_tokenizer, schema))
 

@@ -8,24 +8,9 @@ this module is what the tests exercise directly.
 
 from dataclasses import asdict, dataclass
 
-import httpx
-
 from .. import daemon_client
+from .._http_probe import ProbeResponse, probe_get
 from ..profile_manager import ENV_API_PORT, ENV_CP_PORT, ProfileManager
-
-# The "simple alias" keys that ProfileManager.load_profile_config injects for
-# backward compatibility. They must never be written back into a profile's
-# .env, or they'd pollute it with lowercase duplicates.
-_ALIAS_KEYS = frozenset(
-    {
-        "llm_api_key",
-        "llm_provider",
-        "llm_model",
-        "llm_base_url",
-        "log_level",
-        "idle_timeout",
-    }
-)
 
 # Env var names the wizard owns. Writing config replaces these; everything else
 # in the profile (idle timeout, bank id, custom keys) is preserved untouched.
@@ -188,10 +173,7 @@ def _read_raw_env(name: str) -> dict[str, str]:
         if "=" not in line:
             continue
         key, value = line.split("=", 1)
-        key = key.strip()
-        if key in _ALIAS_KEYS:
-            continue
-        env[key] = value.strip()
+        env[key.strip()] = value.strip()
     return env
 
 
@@ -224,9 +206,9 @@ def list_profiles() -> list[ProfileSummary]:
                 port=info.port,
                 is_active=info.is_active,
                 daemon_running=info.daemon_running,
-                provider=config.get("llm_provider"),
-                model=config.get("llm_model"),
-                has_api_key=bool(config.get("llm_api_key")),
+                provider=config.get(_ENV_PROVIDER),
+                model=config.get(_ENV_MODEL),
+                has_api_key=bool(config.get(_ENV_API_KEY)),
             )
         )
     return summaries
@@ -237,15 +219,15 @@ def get_profile_config(name: str) -> ProfileConfigView:
     name = normalize_profile(name)
     pm = ProfileManager()
     config = pm.load_profile_config(name)
-    api_key = config.get("llm_api_key")
+    api_key = config.get(_ENV_API_KEY)
     paths = pm.resolve_profile_paths(name)
     raw = _read_raw_env(name)
     return ProfileConfigView(
         name=name,
         display_name=_display_name(name),
-        provider=config.get("llm_provider"),
-        model=config.get("llm_model"),
-        base_url=config.get("llm_base_url"),
+        provider=config.get(_ENV_PROVIDER),
+        model=config.get(_ENV_MODEL),
+        base_url=config.get(_ENV_BASE_URL),
         api_key_masked=_mask_key(api_key),
         has_api_key=bool(api_key),
         api_port=paths.port,
@@ -331,13 +313,9 @@ def _daemon_config(name: str) -> dict[str, str]:
     return ProfileManager().load_profile_config(name)
 
 
-def _http_get(url: str, timeout: float = 2.0) -> httpx.Response | None:
+def _http_get(url: str, timeout: float = 2.0) -> ProbeResponse | None:
     """GET helper that returns the response or None on failure (patchable in tests)."""
-    try:
-        with httpx.Client(timeout=timeout) as client:
-            return client.get(url)
-    except Exception:
-        return None
+    return probe_get(url, read_timeout=timeout)
 
 
 def health(name: str) -> HealthView:

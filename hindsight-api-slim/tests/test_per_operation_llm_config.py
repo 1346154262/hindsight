@@ -221,7 +221,7 @@ class TestMockLLMProvider:
             )
 
         result = asyncio.run(make_call())
-        assert result == {"custom": "response"}
+        assert result.content == {"custom": "response"}
 
     def test_mock_provider_returns_usage_when_requested(self):
         """Test that mock provider returns token usage."""
@@ -237,12 +237,9 @@ class TestMockLLMProvider:
         import asyncio
 
         async def make_call():
-            return await provider.call(
-                messages=[{"role": "user", "content": "test"}],
-                return_usage=True,
-            )
+            return await provider.call(messages=[{"role": "user", "content": "test"}])
 
-        result, usage = asyncio.run(make_call())
+        usage = asyncio.run(make_call()).usage
         assert usage.input_tokens == 10
         assert usage.output_tokens == 5
         assert usage.total_tokens == 15
@@ -301,8 +298,7 @@ class TestReflectUsesReflectLLMConfig:
     async def test_reflect_allowed_when_default_llm_none_but_reflect_configured(self, monkeypatch):
         """A disabled default LLM should not block a separately configured reflect LLM."""
         # Constructing a MemoryEngine reaches the configured embeddings provider, which
-        # defaults to the local one. A free-threaded install has no local-ml extra
-        # (sentence-transformers re-enables the GIL), so there is nothing to load.
+        # defaults to the local one, which only exists with the local-ml extra.
         pytest.importorskip("sentence_transformers", reason="MemoryEngine construction needs the local-ml extra")
         from types import SimpleNamespace
         from unittest.mock import AsyncMock

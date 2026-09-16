@@ -4,6 +4,7 @@ These tests exercise the real consolidation implementation with actual database 
 Note: Consolidation runs automatically after retain via SyncTaskBackend in tests.
 """
 
+from hindsight_api.engine.response_models import LLMCallResult, TokenUsage
 import uuid
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -1475,7 +1476,7 @@ class TestHierarchicalRetrieval:
 
         # Search mental models - should find our mental model
         async with memory._pool.acquire() as conn:
-            query_embedding = memory.embeddings.encode(["What does John like?"])[0]
+            query_embedding = (await memory.embeddings.encode(["What does John like?"]))[0]
             mental_model_result = await tool_search_mental_models(
                 memory_engine=memory,
                 conn=conn,
@@ -1537,7 +1538,7 @@ class TestHierarchicalRetrieval:
 
         # Search mental models - should find nothing
         async with memory._pool.acquire() as conn:
-            query_embedding = memory.embeddings.encode(["Where does Sarah work?"])[0]
+            query_embedding = (await memory.embeddings.encode(["Where does Sarah work?"]))[0]
             mental_model_result = await tool_search_mental_models(
                 memory_engine=memory,
                 conn=conn,
@@ -2428,7 +2429,9 @@ class TestBuildResponseModel:
         creates = [_CreateAction(text=f"observation {index}", source_fact_ids=[f"fact-{index}"]) for index in range(3)]
         llm_config = SimpleNamespace(
             _provider_impl=None,
-            call=AsyncMock(return_value=_ConsolidationBatchResponse(creates=creates)),
+            call=AsyncMock(
+                return_value=LLMCallResult(content=_ConsolidationBatchResponse(creates=creates), usage=TokenUsage())
+            ),
         )
         config = SimpleNamespace(
             llm_output_language=None,

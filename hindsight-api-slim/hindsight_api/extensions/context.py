@@ -85,33 +85,30 @@ class DefaultExtensionContext(ExtensionContext):
         database_url: str,
         memory_engine: "MemoryEngineInterface | None" = None,
         webhook_manager: "WebhookManager | None" = None,
-        current_schema: str | None = None,
     ):
         """
         Initialize the context.
+
+        The context is one object shared by every request, so it deliberately carries no
+        per-request state (tenant schema, bank): that would be last-writer-wins under
+        concurrency. Hooks get the tenant/bank from their own arguments.
 
         Args:
             database_url: SQLAlchemy database URL for migrations.
             memory_engine: Optional MemoryEngine instance for memory operations.
             webhook_manager: Optional WebhookManager for firing webhooks.
-            current_schema: Optional current schema name for tenant context.
         """
         self._database_url = database_url
         self._memory_engine = memory_engine
         self.webhook_manager = webhook_manager
-        self.current_schema = current_schema
 
     async def run_migration(self, schema: str) -> None:
         """Run migrations for a specific schema."""
         import asyncio
 
         from hindsight_api.config import get_config
-        from hindsight_api.migrations import (
-            ensure_embedding_dimension,
-            ensure_text_search_extension,
-            ensure_vector_extension,
-            run_migrations,
-        )
+        from hindsight_api.engine.memories import get_memories
+        from hindsight_api.migrations import run_migrations_for_schemas
 
         # Prefer getting URL from memory engine (handles pg0 case where URL is set after init)
         db_url = self._database_url
@@ -120,44 +117,32 @@ class DefaultExtensionContext(ExtensionContext):
             if engine_url:
                 db_url = engine_url
 
-        # Run synchronous migration functions in a thread so the asyncio event loop
-        # remains free. This is critical for single-machine deployments where the
-        # worker runs in-process: if run_migrations() blocks the event loop, any
-        # in-flight asyncpg transactions cannot flush their COMMIT, and
-        # CREATE INDEX CONCURRENTLY inside the migration waits for those transactions
-        # forever — a deadlock.
-        config = get_config()
-        await asyncio.to_thread(
-            run_migrations, db_url, schema=schema, migration_database_url=config.migration_database_url
-        )
-
-        # Ensure embedding column dimension matches the model's dimension
-        # This is needed because migrations create columns with default dimension
+        # Ensure the embedding column dimension matches the model's dimension: migrations
+        # create the columns with a default dimension.
+        embedding_dimension: int | None = None
         if self._memory_engine is not None:
             embeddings = getattr(self._memory_engine, "embeddings", None)
             if embeddings is not None:
-                dimension = getattr(embeddings, "dimension", None)
-                if dimension is not None:
-                    await asyncio.to_thread(
-                        ensure_embedding_dimension,
-                        db_url,
-                        dimension,
-                        schema=schema,
-                        vector_extension=config.vector_extension,
-                    )
+                embedding_dimension = getattr(embeddings, "dimension", None)
 
-        # Ensure vector indexes match the configured extension
+        # One call, not four: run_migrations_for_schemas is the migration-isolation
+        # boundary. Calling run_migrations() and then the ensure_* helpers separately
+        # would run each of them here -- and every one opens SQLAlchemy's sync engine,
+        # i.e. psycopg2, in the server process, sidestepping the isolation the flag
+        # asks for. Startup already goes through this entrypoint; runtime tenant
+        # provisioning must too, or HINDSIGHT_API_MIGRATION_ISOLATION=true silently
+        # stops applying to it.
+        config = get_config()
         await asyncio.to_thread(
-            ensure_vector_extension, db_url, vector_extension=config.vector_extension, schema=schema
-        )
-
-        # Ensure text search columns/indexes match the configured extension
-        await asyncio.to_thread(
-            ensure_text_search_extension,
+            run_migrations_for_schemas,
             db_url,
+            [schema],
+            migration_database_url=config.migration_database_url,
+            embedding_dimension=embedding_dimension,
+            vector_extension=config.vector_extension,
             text_search_extension=config.text_search_extension,
             pg_search_tokenizer=config.text_search_extension_pg_search_tokenizer,
-            schema=schema,
+            store_owned_memories=get_memories().store_owned,
         )
 
         # Provision any extension-owned bank-scoped tables for this schema,

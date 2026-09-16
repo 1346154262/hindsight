@@ -127,8 +127,66 @@ META_CONSOLIDATED_AT = "consolidated_at"
 # query is "not yet consolidated", so it needs a value to match on: every memory is
 # written with "0" and flipped to "1" once folded into an observation.
 META_CONSOLIDATED_FLAG = "consolidated"
+#: The attachments a fact was drawn from, as a JSON list of short ids — the per-fact
+#: provenance the extractor records. Carried on the memory so read surfaces can resolve
+#: it from the rows the store already returned, without a second lookup.
+META_ATTACHMENT_IDS = "attachment_ids"
+
+# Keys in a store-owned DOCUMENT record's metadata map (string -> string, so structured values
+# travel as one JSON string each). Unlike the memory bag above these describe the document, and
+# the same record read serves every one of them.
+#: The document's replayable retain parameters, as one JSON object.
+DOC_META_RETAIN_PARAMS = "retain_params"
+#: The names the caller gave this document's attachments, as a JSON object of short id ->
+#: filename. On the document rather than the fact because a filename describes the reference,
+#: not the bytes: the same image can be "diagram.png" in one document and "fig-2.png" in another.
+#: It is what `document_attachments.filename` holds for a bank whose documents live in SQL.
+DOC_META_ATTACHMENT_FILENAMES = "attachment_filenames"
+#: Where the document's original upload lives in Hindsight's ``file_storage`` — the key
+#: ``documents.file_storage_key`` holds for a bank whose documents live in SQL. The upload's name
+#: and content type ride on the record's own ``file_original_name`` / ``file_content_type``.
+DOC_META_FILE_STORAGE_KEY = "file_storage_key"
 CONSOLIDATED_NO = "0"
 CONSOLIDATED_YES = "1"
+
+
+def document_record_metadata(
+    retain_params: "dict | None", attachment_filenames: "Mapping[str, str] | None" = None
+) -> dict[str, str]:
+    """The metadata map a store-owned document record is written with.
+
+    One builder for every write path, because a path that forgets a key does not fail -- it
+    writes a record without it, and the key reads back as absent until the next full re-ingest.
+    The map REPLACES the record's previous one: a write carries every name the document should
+    keep, which is why the paths that re-send stored text (append, reprocess, an edit re-sending
+    placeholders) carry the names they read back with it.
+    """
+    out: dict[str, str] = {}
+    if retain_params:
+        out[DOC_META_RETAIN_PARAMS] = json.dumps(retain_params)
+    names = {str(k): str(v) for k, v in (attachment_filenames or {}).items() if k and v}
+    if names:
+        out[DOC_META_ATTACHMENT_FILENAMES] = json.dumps(names, sort_keys=True)
+    return out
+
+
+def document_attachment_filenames(record: "Mapping | None") -> dict[str, str]:
+    """A store-owned document record's attachment names (short id -> filename); ``{}`` if none.
+
+    Tolerant by design: a record written before the key existed, or one whose value does not
+    parse, has no names -- which reads back as a null ``filename``, exactly what it read before.
+    """
+    raw = ((record or {}).get("metadata") or {}).get(DOC_META_ATTACHMENT_FILENAMES)
+    if not raw:
+        return {}
+    try:
+        decoded = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        return {}
+    if not isinstance(decoded, dict):
+        return {}
+    return {str(k): str(v) for k, v in decoded.items() if k and v}
+
 
 #: Prefix for the per-source metadata key an observation carries, one per source.
 #: The forward list (:data:`META_SOURCE_MEMORY_IDS`) reads an observation's
@@ -193,6 +251,9 @@ class StoredMemory:
     # outside SQL has no `memory_links` table to reconstruct these from, so without them
     # on the read model an export of such a bank silently loses every causal relation.
     causal_edges: list[CausalEdgeRecord] = field(default_factory=list)
+    # Short ids of the attachments this fact was drawn from (see META_ATTACHMENT_IDS).
+    # Carried so the list and detail views resolve them from this read alone.
+    attachment_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -377,6 +438,9 @@ class FactRecord:
     source_memory_ids: list[str] = field(default_factory=list)
     # When this memory was folded into an observation (sources only).
     consolidated_at: datetime | None = None
+    # Short ids of the attachments this fact was drawn from — what Postgres keeps in
+    # `memory_units.attachment_ids`. Empty for a fact stated in plain text.
+    attachment_ids: list[str] = field(default_factory=list)
 
     def metadata_bag(self) -> dict[str, str]:
         """Render the non-modelled columns as an opaque str→str bag."""
@@ -412,6 +476,9 @@ class FactRecord:
         # Observations are not themselves consolidated, so only sources carry the flag.
         if self.fact_type != "observation":
             bag[META_CONSOLIDATED_FLAG] = CONSOLIDATED_YES if self.consolidated_at else CONSOLIDATED_NO
+        if self.attachment_ids:
+            # Deduplicated in first-seen order, the same normalisation the SQL write applies.
+            bag[META_ATTACHMENT_IDS] = json.dumps(list(dict.fromkeys(self.attachment_ids)))
         return bag
 
 
@@ -495,6 +562,7 @@ def build_fact_records(
                 created_at=now,
                 entity_ids=entity_ids,
                 causal_edges=causal_edges,
+                attachment_ids=list(getattr(fact, "attachment_ids", None) or []),
             )
         )
     return records
@@ -918,7 +986,15 @@ class MemoriesExtension(Extension, ABC):
 
         A store that indexes everything regardless ignores them, which is what the default does —
         and what Postgres does, where the columns behind both arms are maintained by the insert
-        itself and there is nothing separable to skip."""
+        itself and there is nothing separable to skip.
+
+        Returns a **mapping** describing the commit: ``seq`` (the store's write coordinate for this
+        retain), ``unit_ids`` (the ids actually written, echoed back) and ``new_entities`` (how many
+        entities the resolve minted). Read it with ``resp["seq"]`` / ``resp.get(...)``, never as
+        attributes — this is a plain mapping, not a response object, and callers that reached for
+        ``resp.seq`` raised ``AttributeError`` from inside a log line and failed the whole write.
+        Stated here because the return value was previously undeclared, which is what let the two
+        sides disagree without either being obviously wrong."""
         raise NotImplementedError("this store does not support a store-owned retain")
 
     async def assert_writable(self, bank_id: str) -> None:
@@ -1208,6 +1284,29 @@ class MemoriesExtension(Extension, ABC):
         Without it, `update_document(tags=...)` changed the memories' tags and left the document
         itself showing the old ones, which is the sort of half-applied edit that only surfaces in
         the browser a week later."""
+        raise NotImplementedError
+
+    async def set_document_file(
+        self,
+        *,
+        bank_id: str,
+        document_id: str,
+        storage_key: str,
+        original_name: str,
+        content_type: str,
+    ) -> bool:
+        """Record on a document RECORD the uploaded file it was converted from, leaving its bodies
+        alone. Returns ``False`` when the document does not exist.
+
+        Only a ``store_owned`` store implements this; a Postgres store keeps the reference on its
+        own ``documents`` row, so the engine calls it only for a store-owned bank. It is a separate
+        write because a file-convert retain learns the reference in its own task, after the retain
+        that wrote the record; without it the reference had nowhere to go and was silently dropped.
+
+        The storage key is a pointer into Hindsight's ``file_storage``, not bytes the store holds; it
+        goes in the record's metadata under :data:`DOC_META_FILE_STORAGE_KEY`. A later write that replaces the
+        document's content replaces the record, and with it the reference: the new content was not
+        converted from that file."""
         raise NotImplementedError
 
     async def delete_document_record(self, *, bank_id: str, document_id: str) -> None:
@@ -1544,6 +1643,29 @@ class MemoriesExtension(Extension, ABC):
             for scope in scopes
         }
 
+    async def latest_memory_write_at(self, *, conn, fq_table, bank_id: str) -> datetime | None:
+        """The newest ``updated_at`` across the bank's memories, or None if it has none.
+
+        The bank-wide counterpart of :meth:`any_memory_updated_since`, and the
+        shortcut in front of it: a mental model whose watermark is at or past this
+        cannot be stale whatever its scope, so every staleness surface asks this
+        once and only then asks the scoped question for the models it cannot rule
+        out. That is worth a method of its own because the scoped check is the
+        expensive one — it is bounded by the writes since a model's watermark, and
+        a model whose own scope has been quiet pays for all of them.
+
+        None means the bank has no memories, never "unknown": a store that cannot
+        answer cheaply should leave the default in place rather than return None,
+        which callers read as an empty bank and act on.
+
+        The default is the value ``consolidation_freshness`` already computes, so a
+        store works without implementing this; override it when the aggregate costs
+        more than the single value does (Postgres reads it off the
+        ``(bank_id, updated_at)`` index instead of scanning to count).
+        """
+        fresh = await self.consolidation_freshness(conn=conn, fq_table=fq_table, bank_id=bank_id)
+        return fresh.get("last_memory_write_at")
+
     async def live_memory_ids(self, *, conn, fq_table, bank_id: str, unit_ids: list[Any]) -> set[str]:
         """Which of ``unit_ids`` still exist among the bank's live memories.
 
@@ -1609,11 +1731,18 @@ class MemoriesExtension(Extension, ABC):
         """
         raise NotImplementedError
 
-    async def observation_scope_counts(self, *, conn, fq_table, bank_id: str) -> list[dict[str, Any]]:
-        """``[{"tags": list[str], "count": int}]`` — observations grouped by scope.
+    async def observation_scope_counts(
+        self, *, conn, fq_table, bank_id: str, limit: int = 100, offset: int = 0
+    ) -> dict[str, Any]:
+        """One page of the observation scope histogram, paged by the store.
 
-        A scope is the sorted set of tags an observation was consolidated with;
-        ``[]`` is the global (untagged) scope. Most-populous first.
+        Returns ``{"scopes": [{"tags": list[str], "count": int}], "total",
+        "limit", "offset"}``. A scope is the sorted set of tags an observation
+        was consolidated with; ``[]`` is the global (untagged) scope.
+        Most-populous first, then scope ascending. ``total`` counts every
+        distinct scope, not just the page — a bank has as many scopes as it has
+        distinct tag sets, so the store must not ship them all for the caller
+        to trim.
         """
         raise NotImplementedError
 
@@ -1647,11 +1776,20 @@ class MemoriesExtension(Extension, ABC):
 
         ``total`` is the count matching the filters, not the page size, because
         the UI pages on it.
+
+        A store that owns its rows puts each memory's attachment ids on its item as
+        ``"attachment_ids": list[str]`` (see :data:`META_ATTACHMENT_IDS`). The HTTP
+        layer takes the key off and resolves the ids; it cannot read them back from
+        ``memory_units``, which holds none of a store-owned bank's memories. An item
+        without the key shows no attachments.
         """
 
     @abstractmethod
     async def get_memory_unit(self, *, conn, ops, fq_table, bank_id: str, unit_id: str) -> dict[str, Any] | None:
-        """One memory rendered for the curation detail view, or ``None``."""
+        """One memory rendered for the curation detail view, or ``None``.
+
+        Carries ``"attachment_ids"`` on the same terms as :meth:`list_memory_units`.
+        """
 
     # ------------------------------------------------------------------ curation archive
     #
@@ -1960,10 +2098,12 @@ class MemoriesExtension(Extension, ABC):
         return RelinkPassResult()
 
     async def enqueue_entity_prune_candidates(self, *, conn, fq_table, bank_id: str, affected_unit_ids: list) -> int:
-        """Queue the entities ``affected_unit_ids`` reference as prune candidates.
+        """Queue the entities ``affected_unit_ids`` reference as prune candidates,
+        and give back the ``mention_count`` their postings contributed.
 
         Zero for a store that never wrote `unit_entities`: it has no entity
-        postings to lose, so nothing can become an orphan.
+        postings to lose, so nothing can become an orphan and no mention count
+        can drift.
         """
         return 0
 
@@ -1980,6 +2120,7 @@ class MemoriesExtension(Extension, ABC):
 __all__ = [
     "CONSOLIDATED_NO",
     "CONSOLIDATED_YES",
+    "META_ATTACHMENT_IDS",
     "META_CHUNK_ID",
     "META_CONSOLIDATED_AT",
     "META_CONSOLIDATED_FLAG",

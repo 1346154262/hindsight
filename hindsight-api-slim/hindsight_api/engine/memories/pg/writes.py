@@ -71,6 +71,7 @@ async def insert_facts(
     tags_list = []
     observation_scopes_list = []
     text_signals_list = []
+    attachment_ids_list = []
 
     for fact in facts:
         fact_texts.append(_sanitize_text(fact.fact_text))
@@ -110,6 +111,10 @@ async def insert_facts(
             except (ValueError, AttributeError):
                 pass
         text_signals_list.append(" ".join(signal_parts) if signal_parts else None)
+        # Short ids of the attachments this fact was drawn from, as the extractor
+        # attributed them. Empty for a fact stated in the prose — which is most of
+        # them, and the reason this is per fact rather than per chunk.
+        attachment_ids_list.append(json.dumps(list(dict.fromkeys(fact.attachment_ids))))
 
     # Batch insert all facts — delegates to DataAccessOps which handles
     # unnest (PG) vs row-by-row (Oracle) transparently.
@@ -132,6 +137,7 @@ async def insert_facts(
         tags_list,
         observation_scopes_list,
         text_signals_list,
+        attachment_ids_list,
         text_search_extension=config.text_search_extension,
     )
 
@@ -280,6 +286,18 @@ async def delete_stale_observations(
                 remaining_source_ids.append(uuid.UUID(src_str))
                 seen_remaining.add(src_str)
 
+    # Lock every row this sweep touches — the outgoing facts, the observations and their
+    # surviving co-sources, which belong to OTHER documents — in one id order before writing
+    # any of them. Two sweeps over a shared observation otherwise each hold rows the other
+    # writes next and deadlock (#4251). The engine's delete, edit and invalidate paths, which
+    # write their facts first, therefore also sweep before that write, so their locks are
+    # taken in this order too.
+    await conn.fetch(
+        f"SELECT id FROM {fq_table('memory_units')} WHERE bank_id = $1 AND id = ANY($2::uuid[]) ORDER BY id FOR UPDATE",
+        bank_id,
+        sorted({*fact_uuids, *obs_ids, *remaining_source_ids}),
+    )
+
     await conn.execute(
         f"DELETE FROM {fq_table('memory_units')} WHERE id = ANY($1::uuid[])",
         obs_ids,
@@ -417,7 +435,11 @@ async def invalidate_memory(*, conn, fq_table, bank_id: str, unit_id: str, reaso
     )
     if inserted is None:
         return False
-    # The cascade prunes `unit_entities` and `memory_links` with the row.
+    # Links in lock order (see delete_unit_links) — after the causal snapshot above reads them.
+    from .graph import _ops_for
+
+    await _ops_for(conn).delete_unit_links(conn, fq_table("memory_links"), bank_id, [str(unit_id)])
+    # The cascade prunes `unit_entities` with the row.
     await conn.execute(f"DELETE FROM {mu} WHERE id = $1 AND bank_id = $2", str(unit_id), bank_id)
     return True
 
@@ -469,23 +491,26 @@ async def restore_memory(*, conn, fq_table, bank_id: str, unit_id: str) -> Store
         str(unit_id),
         bank_id,
     )
+    from .graph import _ops_for
+
     # Restore the entity postings for entities that still exist — some may have
-    # been swept as orphans while the memory was archived.
+    # been swept as orphans while the memory was archived — and give each one
+    # back the mention invalidation took from it (#4291). One call: the credit
+    # has to follow the postings actually written, so the two cannot be decided
+    # separately.
     if arch_row["entity_ids"]:
-        await conn.execute(
-            f"INSERT INTO {ue} (unit_id, entity_id) "
-            f"SELECT $1, eid FROM unnest($2::uuid[]) AS eid "
-            f"WHERE EXISTS (SELECT 1 FROM {ent} e WHERE e.id = eid AND e.bank_id = $3) "
-            f"ON CONFLICT DO NOTHING",
+        await _ops_for(conn).restore_entity_postings(
+            conn,
+            ue,
+            ent,
+            bank_id,
             str(unit_id),
             arch_row["entity_ids"],
-            bank_id,
         )
     # Rematerialize the causal edges parked at invalidation (#2864). Edges whose peer is still
     # archived or permanently deleted are skipped — the peer keeps its own copy and recreates the
     # edge when it reverts, so the restore is order-independent and idempotent.
     from ...retain.link_utils import rematerialize_causal_links
-    from .graph import _ops_for
 
     causal_json = await conn.fetchval(
         f"SELECT causal_links FROM {arch} WHERE id = $1 AND bank_id = $2", str(unit_id), bank_id
@@ -569,11 +594,10 @@ async def apply_edit(
     )
     # Drop only the DERIVED links — graph maintenance recomputes temporal/semantic. Causal edges
     # are retain-time extraction output that nothing recreates, so an edit preserves them (#2864).
-    await conn.execute(
-        f"DELETE FROM {ml} WHERE (from_unit_id = $1 OR to_unit_id = $1) AND NOT (link_type = ANY($2::text[]))",
-        str(unit_id),
-        list(CAUSAL_LINK_TYPES),
-    )
+    # In lock order, like every other link delete (see delete_unit_links).
+    from .graph import _ops_for
+
+    await _ops_for(conn).delete_unit_links(conn, ml, bank_id, [str(unit_id)], keep_link_types=list(CAUSAL_LINK_TYPES))
 
 
 __all__ = [

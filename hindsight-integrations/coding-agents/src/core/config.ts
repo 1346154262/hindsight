@@ -17,7 +17,12 @@ import { join } from "node:path";
 import { DEFAULT_SEED_LIMIT } from "./seed";
 import { isOptedIn } from "./bank";
 import { log } from "./log";
-import { DEFAULT_OBSERVATION_SCOPES, type ObservationScopes } from "./hindsight";
+import {
+  DEFAULT_OBSERVATION_SCOPES,
+  DEFAULT_PAGE_SEARCH_LIMIT,
+  type ObservationScopes,
+} from "./hindsight";
+import { DEFAULT_PAGE_TRIGGER_CRON, isHashedCron, parseHashedCron } from "./missions";
 
 /** Default config-file path: ~/.hindsight/coding-agent.json */
 export // HINDSIGHT_CONFIG joins the two env exceptions (diag/log files): it points at THE config file,
@@ -87,10 +92,13 @@ export interface RawConfig {
    *  200 while bursts get 429s means the server is rate-limiting concurrency, not total volume —
    *  lower this rather than raising it. */
   maxParallelRetains?: number;
-  reflectTimeoutMs?: number; // session-start reflect timeout (default 120000; hooks cap lower internally)
+  /** Automatic session-reflect timeout (default 20000). The default, with the fallback chain after
+   *  it, fits the 30s prompt-hook timeout the installer registers on hook harnesses; going higher
+   *  there needs that host timeout raised too, or the host kills the hook mid-reflect. */
+  reflectTimeoutMs?: number;
   /** Timeout for the agent-invoked `hindsight_reflect` tool (default 330000). Deliberately its own
    *  knob and much larger than `reflectTimeoutMs`: that one bounds an automatic hook that must fit
-   *  the host's 25s window, whereas this one bounds a call the agent made on purpose and waits on,
+   *  the host's hook window, whereas this one bounds a call the agent made on purpose and waits on,
    *  whose `budget: "high"` synthesis on a populated bank can run for minutes. The default sits
    *  ABOVE the server's own reflect wall timeout (HINDSIGHT_API_REFLECT_WALL_TIMEOUT, 300s) so the
    *  server decides when to give up, not an arbitrary client deadline (#3590). Unset, it inherits
@@ -101,20 +109,46 @@ export interface RawConfig {
    *  timeout. The automatic session-start reflect is NOT affected — it always uses "low" to fit
    *  its hook window. */
   reflectBudget?: "low" | "mid" | "high";
-  /** Inject one reflect synthesis on the session's first prompt (default true). False suppresses
-   *  automatic synthesis; the tool guide routes new goals through pages before optional reflection. */
+  /** What to inject on the session's first prompt (default "reflect"):
+   *    "reflect" — one low-budget reflect synthesis (falls back to pages, then recall, on timeout/5xx)
+   *    "pages"   — the knowledge pages matching the prompt by search (retrieval only, no LLM)
+   *    "recall"  — the bank's memories recalled for the prompt (`recallOptions`; no LLM)
+   *    "none"    — nothing; the tool guide routes new goals through pages before optional reflection */
+  autoInject?: AutoInject;
+  /** @deprecated Use `autoInject`. Still honoured: false = `autoInject: "none"`, true = "reflect";
+   *  ignored when `autoInject` is set. Setting it logs a deprecation warning. */
   autoReflect?: boolean;
+  /** Knowledge pages ONE search returns (default 3). Applies wherever the bank is searched: the
+   *  `autoInject: "pages"` injection, the reflect fallback, and the agent's
+   *  `hindsight_search_knowledge_pages` tool — the limit lives on the client so they can't drift. */
+  pageSearchLimit?: number;
+  /** Recall-request overrides, merged key-by-key into the body every recall sends (the
+   *  `autoInject: "recall"` source and the reflect fallback) — `{"types": ["world",
+   *  "experience"], "max_tokens": 4000}`. Keys are the API's own recall parameters, passed
+   *  through unchanged, so a parameter the API gains needs no new setting here; `query` is the
+   *  one field a config cannot replace. Defaults to `{"types": ["observation"], "budget": "low",
+   *  "max_tokens": 2000, "include": {"entities": null}}`.
+   *
+   *  A bank with consolidation disabled never grows observations, and the default recall comes
+   *  back empty on it: those set `{"types": ["world", "experience"]}`, or `{"types": null}` for
+   *  every type. */
+  recallOptions?: Record<string, unknown>;
   pageRefreshEveryTurns?: number; // knowledge-page refresh cadence in user turns (default 10)
   /** What it COSTS to keep this project's knowledge pages current — the trigger stamped on every
    *  page this plugin creates (the seeded taxonomy and each captured initiative):
-   *    "auto-refresh" (default) — refresh after every consolidation that produced new material
-   *    "cron"                   — refresh on `pageTriggerCron` only, and only when actually stale
+   *    "cron" (default)         — refresh on `pageTriggerCron` only, and only when actually stale
+   *    "auto-refresh"           — refresh after every consolidation that produced new material
    *    "manual"                 — never refresh on its own; the tools and control plane still can
    *  Auto-refresh is both the most current and the most expensive: one LLM synthesis per page per
-   *  consolidation, which adds up fast across auto-surveyed repos (#3506). Existing pages keep the
-   *  trigger they were created with — this changes what NEW pages get. */
+   *  consolidation, which adds up fast across auto-surveyed repos (#3506) — hence the hourly
+   *  staggered schedule as the default. Existing pages keep the trigger they were created with —
+   *  this changes what NEW pages get. */
   pageTriggerType?: "auto-refresh" | "cron" | "manual";
-  /** Schedule for `pageTriggerType: "cron"` — UTC, standard 5-field cron, e.g. "0 3 * * *". */
+  /** Schedule for `pageTriggerType: "cron"` — UTC, standard 5-field cron, e.g. "0 3 * * *".
+   *  Defaults to DEFAULT_PAGE_TRIGGER_CRON ("H * * * *": hourly, on each page's own minute).
+   *  A field written `H` ("0 3 * * *" -> "H H * * *") is replaced per page by a value hashed from
+   *  bank + page name, so pages spread across the period instead of all firing on the one minute
+   *  this shared setting names. See `expandCronHash` in core/missions.ts. */
   pageTriggerCron?: string;
   autoSeed?: boolean; // SessionStart: auto-seed a cold repo's bank from git history (default true)
   seedLimit?: number; // SessionStart auto-seed: most-recent-N-commits cap (default 300)
@@ -204,7 +238,9 @@ export interface Config {
   reflectTimeoutMs: number;
   reflectToolTimeoutMs: number;
   reflectBudget: "low" | "mid" | "high";
-  autoReflect: boolean;
+  autoInject: AutoInject;
+  pageSearchLimit: number;
+  recallOptions: Record<string, unknown>;
   pageRefreshEveryTurns: number;
   pageTriggerType: "auto-refresh" | "cron" | "manual";
   pageTriggerCron?: string;
@@ -225,25 +261,45 @@ export interface Config {
 }
 
 /**
- * Which page-refresh trigger a raw config asks for.
+ * The page-refresh trigger a raw config asks for: the schedule kind, and the expression it fires on.
  *
- * `"cron"` without a `pageTriggerCron` is a broken config, not a request to stop refreshing: the
- * API rejects a cron trigger with no expression, which would fail page creation outright. Fall
- * back to the default and say so — a user who wants pages to stop refreshing writes "manual".
+ * `"cron"` is the default and needs no `pageTriggerCron`: an omitted expression takes
+ * DEFAULT_PAGE_TRIGGER_CRON, so the common config — none of these fields at all — is an hourly
+ * staggered refresh. A user who wants pages to stop refreshing on their own writes "manual".
+ *
+ * A malformed `H` is refused here and not one step later: `expandCronHash` leaves an expression it
+ * cannot read alone, so an unchecked `"H(9-3) * * * *"` would reach the server verbatim and fail
+ * page creation with a cron parse error naming syntax this package invented. Such an expression
+ * takes the default schedule, with a warning — the same as writing none. Ordinary cron syntax
+ * stays unvalidated: the server owns that, and duplicating its parser here would only disagree
+ * with it.
  */
-function resolvePageTriggerType(raw: RawConfig): "auto-refresh" | "cron" | "manual" {
-  if (raw.pageTriggerType === "manual") return "manual";
-  if (raw.pageTriggerType === "cron") {
-    if (raw.pageTriggerCron?.trim()) return "cron";
+function resolvePageTrigger(raw: RawConfig): {
+  type: "auto-refresh" | "cron" | "manual";
+  cron?: string;
+} {
+  if (raw.pageTriggerType === "manual") return { type: "manual" };
+  if (raw.pageTriggerType === "auto-refresh") return { type: "auto-refresh" };
+  if (raw.pageTriggerType !== undefined && raw.pageTriggerType !== "cron")
     log.warn(
       "config",
-      'pageTriggerType "cron" needs pageTriggerCron (UTC 5-field, e.g. "0 3 * * *") — ' +
-        'falling back to "auto-refresh"'
+      `ignoring pageTriggerType=${JSON.stringify(raw.pageTriggerType)} — ` +
+        "expected cron|auto-refresh|manual"
     );
-  }
-  return "auto-refresh";
+  const cron = raw.pageTriggerCron?.trim();
+  if (!cron) return { type: "cron", cron: DEFAULT_PAGE_TRIGGER_CRON };
+  if (!isHashedCron(cron) || parseHashedCron(cron)) return { type: "cron", cron };
+  log.warn(
+    "config",
+    `pageTriggerCron ${JSON.stringify(cron)} has a malformed hashed field — ` +
+      'write `H` or `H(<lo>-<hi>)` within the field\'s own range, e.g. "H H(0-5) * * *" — ' +
+      `falling back to ${JSON.stringify(DEFAULT_PAGE_TRIGGER_CRON)}`
+  );
+  return { type: "cron", cron: DEFAULT_PAGE_TRIGGER_CRON };
 }
 
+/** Default timeout for the automatic hook reflect — see RawConfig.reflectTimeoutMs. */
+export const DEFAULT_REFLECT_TIMEOUT_MS = 20_000;
 /** Default timeout for the agent-invoked `hindsight_reflect` tool — see RawConfig.reflectToolTimeoutMs. */
 export const DEFAULT_REFLECT_TOOL_TIMEOUT_MS = 330_000;
 
@@ -302,11 +358,25 @@ function resolveObservationScopes(raw: RawConfig["observationScopes"]): Observat
 }
 
 /** Apply defaults to a raw (file) config. Pure — the single place the defaults live. */
+export type AutoInject = "reflect" | "pages" | "recall" | "none";
+const AUTO_INJECT_MODES: readonly AutoInject[] = ["reflect", "pages", "recall", "none"];
+
+/** `autoInject` wins; otherwise the deprecated `autoReflect: false` means "none". */
+function resolveAutoInject(raw: RawConfig): AutoInject {
+  if (raw.autoReflect !== undefined) {
+    const replacement = raw.autoReflect === false ? "none" : "reflect";
+    log.warn("config", `autoReflect is deprecated — use autoInject: "${replacement}" instead`);
+  }
+  if (AUTO_INJECT_MODES.includes(raw.autoInject as AutoInject)) return raw.autoInject as AutoInject;
+  return raw.autoReflect === false ? "none" : "reflect";
+}
+
 export function resolveConfig(raw: RawConfig = {}): Config {
   const serverMode = ["cloud", "self-hosted", "daemon"].includes(raw.serverMode as string)
     ? (raw.serverMode as "cloud" | "self-hosted" | "daemon")
     : "cloud";
   const apiPort = raw.apiPort || DEFAULT_DAEMON_PORT;
+  const pageTrigger = resolvePageTrigger(raw);
   return {
     serverMode,
     // Daemon mode resolves the URL HERE rather than at each call site: every entry point already
@@ -337,7 +407,7 @@ export function resolveConfig(raw: RawConfig = {}): Config {
     retainSessions: raw.retainSessions ?? true, // write sessions back by default, every harness
     manageBankConfig: raw.manageBankConfig ?? true,
     maxParallelRetains: raw.maxParallelRetains || 10,
-    reflectTimeoutMs: raw.reflectTimeoutMs || 120000,
+    reflectTimeoutMs: raw.reflectTimeoutMs || DEFAULT_REFLECT_TIMEOUT_MS,
     // Inherit an explicitly-raised reflectTimeoutMs (that is what users reaching for a longer
     // reflect already set), but never let it LOWER the tool below the default — a short window is
     // set to bound the automatic hook, not to cut off a call the agent is waiting on.
@@ -345,10 +415,19 @@ export function resolveConfig(raw: RawConfig = {}): Config {
       raw.reflectToolTimeoutMs ||
       Math.max(raw.reflectTimeoutMs || 0, DEFAULT_REFLECT_TOOL_TIMEOUT_MS),
     reflectBudget: resolveReflectBudget(raw),
-    autoReflect: raw.autoReflect ?? true,
+    autoInject: resolveAutoInject(raw),
+    pageSearchLimit: raw.pageSearchLimit || DEFAULT_PAGE_SEARCH_LIMIT,
+    // Same shape as retainMetadata: an object, or nothing. An array would spread into numeric
+    // keys and reach the API as garbage, so it is rejected like any other non-object.
+    recallOptions:
+      raw.recallOptions &&
+      typeof raw.recallOptions === "object" &&
+      !Array.isArray(raw.recallOptions)
+        ? { ...raw.recallOptions }
+        : {},
     pageRefreshEveryTurns: raw.pageRefreshEveryTurns || 10,
-    pageTriggerType: resolvePageTriggerType(raw),
-    pageTriggerCron: raw.pageTriggerCron?.trim() || undefined,
+    pageTriggerType: pageTrigger.type,
+    pageTriggerCron: pageTrigger.cron,
     autoSeed: raw.autoSeed ?? true,
     seedLimit: raw.seedLimit || DEFAULT_SEED_LIMIT,
     codebaseSurvey: raw.codebaseSurvey ?? true,
@@ -425,7 +504,7 @@ function applyLayer(raw: RawConfig, layer: RawConfig, harness?: string): RawConf
  * containers, CI, and secret managers that inject `HINDSIGHT_API_TOKEN` rather than writing a
  * credential to disk.
  *
- * The map-valued settings (mapPathToBank, harnesses, banks, retainMetadata) are deliberately
+ * The map-valued settings (mapPathToBank, harnesses, banks, retainMetadata, recallOptions) are deliberately
  * absent: they are structures whose whole point is per-repo/per-harness/per-key branching, which
  * does not survive flattening into one env var. They stay file-only.
  */
@@ -453,6 +532,8 @@ const ENV_KEYS = {
   reflectTimeoutMs: "HINDSIGHT_REFLECT_TIMEOUT_MS",
   reflectToolTimeoutMs: "HINDSIGHT_REFLECT_TOOL_TIMEOUT_MS",
   reflectBudget: "HINDSIGHT_REFLECT_BUDGET",
+  autoInject: "HINDSIGHT_AUTO_INJECT",
+  pageSearchLimit: "HINDSIGHT_PAGE_SEARCH_LIMIT",
   autoReflect: "HINDSIGHT_AUTO_REFLECT",
   pageRefreshEveryTurns: "HINDSIGHT_PAGE_REFRESH_EVERY_TURNS",
   pageTriggerType: "HINDSIGHT_PAGE_TRIGGER_TYPE",
@@ -495,6 +576,7 @@ const ENV_NUMBERS = new Set<keyof RawConfig>([
   "maxParallelRetains",
   "reflectTimeoutMs",
   "reflectToolTimeoutMs",
+  "pageSearchLimit",
   "pageRefreshEveryTurns",
   "seedLimit",
   "surveyBudgetUsd",
@@ -597,5 +679,7 @@ function resolvePartial(cfg: Config, patch: RawConfig): Partial<Config> {
     if (key in full)
       (out as Record<string, unknown>)[key] = (full as unknown as Record<string, unknown>)[key];
   }
+  // The legacy key resolves into a differently-named field, so the loop above can't carry it.
+  if ("autoReflect" in patch && !("autoInject" in patch)) out.autoInject = full.autoInject;
   return out;
 }

@@ -7,6 +7,8 @@ import { resolveTemporalWindow } from "@/lib/temporal-window";
 import { useBank } from "@/lib/bank-context";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
+import { DisclosureButton, Hint, Row, Section, Segmented } from "@/components/form-layout";
 import { toast } from "sonner";
 import {
   Select,
@@ -15,38 +17,94 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Checkbox } from "@/components/ui/checkbox";
 import { FactType, FactTypeFilter } from "@/components/fact-type-filter";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   Search,
   Clock,
-  Zap,
   ChevronRight,
   ChevronDown,
   Database,
-  FileText,
-  Users,
   ArrowDown,
-  Tag,
   Calendar,
-  CalendarRange,
 } from "lucide-react";
 import { Spinner } from "@/components/ui/spinner";
 import JsonView from "react18-json-view";
 import "react18-json-view/src/style.css";
-import { MemoryDetailPanel } from "./memory-detail-panel";
+import { MemoryDetailModal } from "./memory-detail-modal";
+import { AttachmentStrip, RetainedAttachment } from "@/components/ui/inline-attachment-text";
+import { EntityChip, TagChip } from "@/components/ui/facet-chip";
 
 type Budget = "low" | "mid" | "high";
 type TagsMatch = "any" | "all" | "any_strict" | "all_strict" | "exact";
 type ViewMode = "results" | "trace" | "json";
 
-// Render a score at FULL precision — never round. Rounded scores hide meaningful
-// differences (e.g. 0.001125 vs 0.001004 both render as "0.001"), which is exactly
-// what makes the reranker's behaviour hard to read. `null`/`undefined` → em dash.
-const fmtScore = (v: number | null | undefined): string =>
-  v === null || v === undefined ? "—" : String(v);
+// Significant digits, never a fixed number of decimals. This used to print the
+// raw value for a reason: fusion scores cluster around 0.001, where toFixed(3)
+// collapses 0.001125 and 0.001004 to the same "0.001" and makes the reranker's
+// behaviour impossible to read. Four significant digits keeps those apart while
+// still trimming 0.8765526740786869 to 0.8766, and the exact value stays one
+// hover away wherever there is room for a tooltip. `null`/`undefined` → em dash.
+const fmtScore = (v: number | null | undefined): string => {
+  if (v === null || v === undefined) return "—";
+  if (!Number.isFinite(v)) return String(v);
+  // `Number(...)` drops the trailing zeros toPrecision pads on (0.8 → "0.8000").
+  return String(Number(v.toPrecision(4)));
+};
+
+// Timestamps are rendered in UTC, matching what the temporal-window hint on this
+// same page tells you times are read as — and a fact the extractor dated to a
+// day arrives as midnight UTC, which in any other zone would shift it onto the
+// wrong date entirely.
+//
+// The time is dropped when it *is* that midnight: printing "00:00" beside a
+// date-only occurrence invents a precision the memory does not have.
+const UTC_DATE: Intl.DateTimeFormatOptions = {
+  day: "numeric",
+  month: "short",
+  year: "numeric",
+  timeZone: "UTC",
+};
+const UTC_TIME: Intl.DateTimeFormatOptions = {
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+  timeZone: "UTC",
+};
+
+const fmtWhen = (v: string | null | undefined): string => {
+  if (!v) return "";
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return String(v);
+  const date = d.toLocaleDateString(undefined, UTC_DATE);
+  const isDateOnly = d.getUTCHours() === 0 && d.getUTCMinutes() === 0 && d.getUTCSeconds() === 0;
+  return isDateOnly ? date : `${date} ${d.toLocaleTimeString(undefined, UTC_TIME)}`;
+};
+
+// A day-granularity occurrence is stored as the whole day — 00:00:00 to
+// 23:59:59.999 — so rendering it as a range prints "3 Mar 2024 → 3 Mar 2024
+// 23:59", which reads as a precision that was never claimed. Collapse it back to
+// the single date it means.
+const fmtWhenRange = (start: string, end: string | null | undefined): string => {
+  if (!end || end === start) return fmtWhen(start);
+  const from = new Date(start);
+  const to = new Date(end);
+  if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) return fmtWhen(start);
+  const sameDay = from.toISOString().slice(0, 10) === to.toISOString().slice(0, 10);
+  const wholeDay =
+    from.getUTCHours() === 0 &&
+    from.getUTCMinutes() === 0 &&
+    from.getUTCSeconds() === 0 &&
+    to.getUTCHours() === 23 &&
+    to.getUTCMinutes() === 59;
+  if (sameDay && wholeDay) return fmtWhen(start);
+  return `${fmtWhen(start)} → ${fmtWhen(end)}`;
+};
+
+/** The unrounded value, for a `title` beside a rounded one. */
+const exactScore = (v: number | null | undefined): string | undefined =>
+  v === null || v === undefined ? undefined : String(v);
 
 export function SearchDebugView() {
   const t = useTranslations("searchDebug");
@@ -59,21 +117,30 @@ export function SearchDebugView() {
   const [maxTokens, setMaxTokens] = useState(4096);
   const [queryDate, setQueryDate] = useState("");
   const [includeChunks, setIncludeChunks] = useState(false);
-  const [includeEntities, setIncludeEntities] = useState(false);
+  // On by default: the entity names shown as chips on each result come back only
+  // when entities are included — the flag gates the names, not just the entity
+  // observations block — and "what is this fact about" is the first thing worth
+  // seeing in a results list. Untick it to recall without the extra lookup.
+  const [includeEntities, setIncludeEntities] = useState(true);
   const [windowStart, setWindowStart] = useState("");
   const [windowEnd, setWindowEnd] = useState("");
   const [tags, setTags] = useState("");
   const [tagsMatch, setTagsMatch] = useState<TagsMatch>("any");
+  const [optionsOpen, setOptionsOpen] = useState(false);
 
   // Results state
   const [results, setResults] = useState<any[] | null>(null);
   const [entities, setEntities] = useState<any[] | null>(null);
-  const [chunks, setChunks] = useState<any[] | null>(null);
+  // Keyed by chunk id (`chunk_id -> ChunkData`), which is the shape the API
+  // returns — it was typed as an array, which no consumer could index. Only the
+  // JSON view reads it: results take their attachments from the fact's own edge,
+  // never from the chunk (see attachmentsForResult).
+  const [chunks, setChunks] = useState<Record<string, any> | null>(null);
   const [observations, setObservations] = useState<any[] | null>(null);
   const [trace, setTrace] = useState<any | null>(null);
   const [loading, setLoading] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("results");
-  const [selectedMemory, setSelectedMemory] = useState<any | null>(null);
+  const [selectedMemoryId, setSelectedMemoryId] = useState<string | null>(null);
   const [expandedSteps, setExpandedSteps] = useState<Set<string>>(new Set());
   const [expandedResults, setExpandedResults] = useState<Set<string>>(new Set());
 
@@ -103,15 +170,31 @@ export function SearchDebugView() {
 
   const INITIAL_RESULTS_COUNT = 5;
 
-  // Helper to find full memory data from results when clicking trace items
+  // Trace rows carry the memory id under either key; the dialog fetches the rest
+  // itself, so there is nothing to look up in `results` any more.
   const selectMemoryFromTrace = (traceResult: any) => {
-    const nodeId = traceResult.id || traceResult.node_id;
-    // Try to find the full result with all metadata
-    const fullResult = results?.find((r: any) => r.id === nodeId || r.node_id === nodeId);
-    setSelectedMemory(fullResult || traceResult);
+    setSelectedMemoryId(traceResult.id || traceResult.node_id || null);
   };
 
   const temporalWindow = resolveTemporalWindow(windowStart, windowEnd);
+  // How many collapsed options differ from their defaults, so a hidden setting
+  // still shows on the Options toggle.
+  const activeOptions = [
+    maxTokens !== 4096,
+    Boolean(queryDate),
+    includeChunks,
+    !includeEntities,
+    Boolean(tags.trim()),
+    Boolean(windowStart || windowEnd),
+  ].filter(Boolean).length;
+
+  // Only the edge the extractor recorded for this fact. There is no falling back
+  // to the chunk's attachments: a chunk lists everything its text references, so
+  // a fact drawn from the prose beside a screenshot would be shown that
+  // screenshot as its evidence. A fact the extractor attributed to nothing shows
+  // nothing, which is the honest answer.
+  const attachmentsForResult = (result: any): RetainedAttachment[] =>
+    (result?.attachments as RetainedAttachment[] | undefined) ?? [];
 
   const runSearch = async () => {
     // Guard here, not just on the button: Enter in the query box calls this
@@ -214,137 +297,160 @@ export function SearchDebugView() {
             </Button>
           </div>
 
-          {/* Filters */}
-          <div className="flex flex-wrap items-center gap-6 mt-4 pt-4 border-t">
-            <FactTypeFilter value={factTypes} onChange={setFactTypes} label={t("typesLabel")} />
-
-            <div className="h-6 w-px bg-border" />
-
-            {/* Budget */}
-            <div className="flex items-center gap-2">
-              <Zap className="h-4 w-4 text-muted-foreground" />
-              <Select value={budget} onValueChange={(v) => setBudget(v as Budget)}>
-                <SelectTrigger className="w-24 h-8">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="low">{t("budgetLow")}</SelectItem>
-                  <SelectItem value="mid">{t("budgetMid")}</SelectItem>
-                  <SelectItem value="high">{t("budgetHigh")}</SelectItem>
-                </SelectContent>
-              </Select>
+          {/* Everyday filters inline; everything else behind Options. */}
+          <div className="mt-4 flex flex-wrap items-center gap-x-6 gap-y-3">
+            <div className="flex items-center gap-1.5">
+              <FactTypeFilter value={factTypes} onChange={setFactTypes} label={t("typesLabel")} />
+              <Hint text={t("helpTypes")} />
             </div>
-
-            {/* Max Tokens */}
             <div className="flex items-center gap-2">
-              <span className="text-sm text-muted-foreground">{t("tokensLabel")}</span>
-              <Input
-                type="number"
-                value={maxTokens}
-                onChange={(e) => setMaxTokens(parseInt(e.target.value))}
-                className="w-24 h-8"
+              <span className="text-sm text-muted-foreground">{t("budgetLabel")}</span>
+              <Hint text={t("helpBudget")} />
+              <Segmented
+                value={budget}
+                onChange={setBudget}
+                ariaLabel={t("budgetLabel")}
+                options={[
+                  { value: "low", label: t("budgetLow") },
+                  { value: "mid", label: t("budgetMid") },
+                  { value: "high", label: t("budgetHigh") },
+                ]}
               />
             </div>
-
-            {/* Query Date */}
-            <div className="flex items-center gap-2">
-              <Clock className="h-4 w-4 text-muted-foreground" />
-              <Input
-                type="datetime-local"
-                value={queryDate}
-                onChange={(e) => setQueryDate(e.target.value)}
-                className="h-8"
-                placeholder={t("queryDatePlaceholder")}
+            <div className="ml-auto">
+              <DisclosureButton
+                open={optionsOpen}
+                onToggle={() => setOptionsOpen((open) => !open)}
+                label={t("optionsLabel")}
+                badge={activeOptions}
               />
-            </div>
-
-            <div className="h-6 w-px bg-border" />
-
-            {/* Include options */}
-            <div className="flex items-center gap-4">
-              <label className="flex items-center gap-2 cursor-pointer">
-                <Checkbox
-                  checked={includeChunks}
-                  onCheckedChange={(c) => setIncludeChunks(c as boolean)}
-                />
-                <FileText className="h-4 w-4 text-muted-foreground" />
-                <span className="text-sm">{t("chunks")}</span>
-              </label>
-              <label className="flex items-center gap-2 cursor-pointer">
-                <Checkbox
-                  checked={includeEntities}
-                  onCheckedChange={(c) => setIncludeEntities(c as boolean)}
-                />
-                <Users className="h-4 w-4 text-muted-foreground" />
-                <span className="text-sm">{t("entities")}</span>
-              </label>
             </div>
           </div>
 
-          {/* Tags Filter */}
-          <div className="flex items-center gap-4 mt-4 pt-4 border-t">
-            <Tag className="h-4 w-4 text-muted-foreground" />
-            <div className="flex-1 max-w-md">
-              <Input
-                type="text"
-                value={tags}
-                onChange={(e) => setTags(e.target.value)}
-                placeholder={t("tagsPlaceholder")}
-                className="h-8"
-              />
-            </div>
-            <Select value={tagsMatch} onValueChange={(v) => setTagsMatch(v as TagsMatch)}>
-              <SelectTrigger className="w-40 h-8">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="any">{t("tagsMatchAny")}</SelectItem>
-                <SelectItem value="all">{t("tagsMatchAll")}</SelectItem>
-                <SelectItem value="any_strict">{t("tagsMatchAnyStrict")}</SelectItem>
-                <SelectItem value="all_strict">{t("tagsMatchAllStrict")}</SelectItem>
-                <SelectItem value="exact">{t("tagsMatchExact")}</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
+          {optionsOpen && (
+            <div className="mt-5 grid gap-8 md:grid-cols-2">
+              <Section title={t("sectionRetrieval")}>
+                <Row
+                  label={t("maxTokensLabel")}
+                  description={t("helpMaxTokens")}
+                  htmlFor="recall-max-tokens"
+                >
+                  <Input
+                    id="recall-max-tokens"
+                    type="number"
+                    value={maxTokens}
+                    onChange={(e) => setMaxTokens(parseInt(e.target.value))}
+                    className="h-8"
+                  />
+                </Row>
+                <Row
+                  label={t("queryDatePlaceholder")}
+                  description={t("helpQueryDate")}
+                  htmlFor="recall-query-date"
+                >
+                  <Input
+                    id="recall-query-date"
+                    type="datetime-local"
+                    value={queryDate}
+                    onChange={(e) => setQueryDate(e.target.value)}
+                    className="h-8"
+                  />
+                </Row>
+                <Row label={t("chunks")} description={t("helpChunks")} htmlFor="recall-chunks">
+                  <div className="flex sm:justify-end">
+                    <Switch
+                      id="recall-chunks"
+                      checked={includeChunks}
+                      onCheckedChange={setIncludeChunks}
+                    />
+                  </div>
+                </Row>
+                <Row
+                  label={t("entities")}
+                  description={t("entitiesHint")}
+                  htmlFor="recall-entities"
+                >
+                  <div className="flex sm:justify-end">
+                    <Switch
+                      id="recall-entities"
+                      checked={includeEntities}
+                      onCheckedChange={setIncludeEntities}
+                    />
+                  </div>
+                </Row>
+              </Section>
 
-          {/* Temporal window */}
-          <div className="flex flex-wrap items-center gap-4 mt-4 pt-4 border-t">
-            <CalendarRange className="h-4 w-4 text-muted-foreground" />
-            <span className="text-sm text-muted-foreground">{t("temporalWindowLabel")}</span>
-            <Input
-              type="datetime-local"
-              value={windowStart}
-              onChange={(e) => setWindowStart(e.target.value)}
-              aria-label={t("temporalWindowStart")}
-              className="h-8 w-56"
-            />
-            <span className="text-sm text-muted-foreground">{t("temporalWindowTo")}</span>
-            <Input
-              type="datetime-local"
-              value={windowEnd}
-              onChange={(e) => setWindowEnd(e.target.value)}
-              aria-label={t("temporalWindowEnd")}
-              className="h-8 w-56"
-            />
-            {(windowStart || windowEnd) && (
-              <Button
-                variant="ghost"
-                size="sm"
-                className="h-8"
-                onClick={() => {
-                  setWindowStart("");
-                  setWindowEnd("");
-                }}
-              >
-                {t("temporalWindowClear")}
-              </Button>
-            )}
-            <p
-              className={`w-full text-xs ${temporalWindow.reversed ? "text-destructive" : "text-muted-foreground"}`}
-            >
-              {temporalWindow.reversed ? t("temporalWindowReversed") : t("temporalWindowHint")}
-            </p>
-          </div>
+              <Section title={t("sectionFilters")}>
+                <Row label={t("tagsLabel")} description={t("helpTags")} htmlFor="recall-tags">
+                  <Input
+                    id="recall-tags"
+                    type="text"
+                    value={tags}
+                    onChange={(e) => setTags(e.target.value)}
+                    placeholder={t("tagsPlaceholder")}
+                    className="h-8"
+                  />
+                </Row>
+                <Row label={t("tagsMatchLabel")} description={t("helpTagsMatch")}>
+                  <Select value={tagsMatch} onValueChange={(v) => setTagsMatch(v as TagsMatch)}>
+                    <SelectTrigger className="h-8">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="any">{t("tagsMatchAny")}</SelectItem>
+                      <SelectItem value="all">{t("tagsMatchAll")}</SelectItem>
+                      <SelectItem value="any_strict">{t("tagsMatchAnyStrict")}</SelectItem>
+                      <SelectItem value="all_strict">{t("tagsMatchAllStrict")}</SelectItem>
+                      <SelectItem value="exact">{t("tagsMatchExact")}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </Row>
+                <div className="space-y-2">
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-sm font-medium text-foreground">
+                      {t("temporalWindowLabel")}
+                    </span>
+                    <Hint text={t("temporalWindowHint")} />
+                    {(windowStart || windowEnd) && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="ml-auto h-7"
+                        onClick={() => {
+                          setWindowStart("");
+                          setWindowEnd("");
+                        }}
+                      >
+                        {t("temporalWindowClear")}
+                      </Button>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Input
+                      type="datetime-local"
+                      value={windowStart}
+                      onChange={(e) => setWindowStart(e.target.value)}
+                      aria-label={t("temporalWindowStart")}
+                      className="h-8 flex-1"
+                    />
+                    <span className="text-xs text-muted-foreground">{t("temporalWindowTo")}</span>
+                    <Input
+                      type="datetime-local"
+                      value={windowEnd}
+                      onChange={(e) => setWindowEnd(e.target.value)}
+                      aria-label={t("temporalWindowEnd")}
+                      className="h-8 flex-1"
+                    />
+                  </div>
+                </div>
+              </Section>
+            </div>
+          )}
+
+          {/* Outside the panel: it is why Recall is disabled, so it must show even collapsed. */}
+          {temporalWindow.reversed && (
+            <p className="mt-3 text-xs text-destructive">{t("temporalWindowReversed")}</p>
+          )}
         </CardContent>
       </Card>
 
@@ -454,7 +560,7 @@ export function SearchDebugView() {
                       <Card
                         key={idx}
                         className="cursor-pointer hover:border-primary/50 transition-colors"
-                        onClick={() => setSelectedMemory(result)}
+                        onClick={() => setSelectedMemoryId(result.id)}
                       >
                         <CardContent className="py-4">
                           <div className="flex items-start gap-4">
@@ -463,7 +569,7 @@ export function SearchDebugView() {
                             </div>
                             <div className="flex-1 min-w-0">
                               <p className="text-foreground">{result.text}</p>
-                              <div className="flex items-center gap-4 mt-2 text-xs text-muted-foreground">
+                              <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mt-2 text-xs text-muted-foreground">
                                 <span className="px-2 py-0.5 rounded bg-muted capitalize">
                                   {result.type || "world"}
                                 </span>
@@ -471,31 +577,86 @@ export function SearchDebugView() {
                                   <span className="truncate max-w-xs">{result.context}</span>
                                 )}
                                 {result.occurred_start && (
-                                  <span>
-                                    {new Date(result.occurred_start).toLocaleDateString()}
+                                  <span
+                                    className="inline-flex items-center gap-1 whitespace-nowrap"
+                                    title={result.occurred_start}
+                                  >
+                                    <Calendar className="h-3 w-3 shrink-0" />
+                                    {t("occurredLabel")}{" "}
+                                    {fmtWhenRange(result.occurred_start, result.occurred_end)}
+                                  </span>
+                                )}
+                                {result.mentioned_at && (
+                                  <span
+                                    className="inline-flex items-center gap-1 whitespace-nowrap"
+                                    title={result.mentioned_at}
+                                  >
+                                    <Clock className="h-3 w-3 shrink-0" />
+                                    {t("mentionedLabel")} {fmtWhen(result.mentioned_at)}
                                   </span>
                                 )}
                               </div>
-                              {result.scores && (
-                                <div className="flex flex-wrap gap-x-3 gap-y-1 mt-2 text-[10px] text-muted-foreground font-mono">
-                                  <span>final {fmtScore(result.scores.final)}</span>
-                                  {result.scores.reranker !== null &&
-                                    result.scores.reranker !== undefined && (
-                                      <span>reranker {fmtScore(result.scores.reranker)}</span>
-                                    )}
-                                  {result.scores.semantic !== null &&
-                                    result.scores.semantic !== undefined && (
-                                      <span>semantic {fmtScore(result.scores.semantic)}</span>
-                                    )}
-                                  {result.scores.keyword !== null &&
-                                    result.scores.keyword !== undefined && (
-                                      <span>keyword {fmtScore(result.scores.keyword)}</span>
-                                    )}
+                              {/* Boolean, not a bare length: `0 && ...` renders a
+                                  literal "0" for a fact with empty arrays. */}
+                              {((result.entities?.length ?? 0) > 0 ||
+                                (result.tags?.length ?? 0) > 0) && (
+                                // Entities and tags, not the score breakdown:
+                                // what the fact is *about* is what a reader
+                                // scanning results needs. The per-signal scores
+                                // (semantic/keyword/reranker and the boosts they
+                                // feed) are a retrieval-debugging concern and
+                                // live in the Trace tab, which shows them per
+                                // stage rather than as a flat row here.
+                                <div className="flex flex-wrap gap-1.5 mt-2">
+                                  {(result.entities ?? []).map((entity: string) => (
+                                    <EntityChip
+                                      key={`e-${entity}`}
+                                      entity={entity}
+                                      size="xs"
+                                      truncate
+                                      className="max-w-[220px]"
+                                    />
+                                  ))}
+                                  {(result.tags ?? []).map((tag: string) => (
+                                    <TagChip
+                                      key={`t-${tag}`}
+                                      tag={tag}
+                                      size="xs"
+                                      truncate
+                                      className="max-w-[220px]"
+                                    />
+                                  ))}
                                 </div>
                               )}
+                              {(() => {
+                                const attachments = attachmentsForResult(result);
+                                if (attachments.length === 0) return null;
+                                return (
+                                  // Each attachment is a link to its own bytes;
+                                  // without stopping the click here it would also
+                                  // bubble to the card and open the memory dialog
+                                  // on top of the image the reader just asked for.
+                                  <div
+                                    className="mt-3"
+                                    onClick={(e) => e.stopPropagation()}
+                                    role="presentation"
+                                  >
+                                    <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                                      {t("factAttachments")}
+                                    </div>
+                                    <AttachmentStrip
+                                      bankId={currentBank}
+                                      attachments={attachments}
+                                      className="mt-1"
+                                    />
+                                  </div>
+                                );
+                              })()}
                             </div>
                             <div className="flex-shrink-0 text-right">
-                              <div className="text-sm font-semibold">{fmtScore(score)}</div>
+                              <div className="text-sm font-semibold" title={exactScore(score)}>
+                                {fmtScore(score)}
+                              </div>
                               <div className="text-xs text-muted-foreground">{t("scoreLabel")}</div>
                             </div>
                             <ChevronRight className="h-5 w-5 text-muted-foreground flex-shrink-0" />
@@ -1119,17 +1280,12 @@ export function SearchDebugView() {
         </Card>
       )}
 
-      {/* Memory Detail Panel */}
-      {selectedMemory && (
-        <div className="fixed right-0 top-0 h-screen w-[420px] bg-card border-l shadow-2xl z-50 overflow-y-auto">
-          <MemoryDetailPanel
-            memory={selectedMemory}
-            onClose={() => setSelectedMemory(null)}
-            inPanel
-            bankId={currentBank || undefined}
-          />
-        </div>
-      )}
+      {/* The same dialog every other view opens a memory in. It was a fixed
+          right-hand drawer here, which meant one memory rendered two different
+          ways depending on where you clicked — and the drawer was fed a recall
+          *result*, which carries none of the detail (attachments included) that
+          fetching the memory by id returns. */}
+      <MemoryDetailModal memoryId={selectedMemoryId} onClose={() => setSelectedMemoryId(null)} />
     </div>
   );
 }

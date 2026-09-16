@@ -15,13 +15,12 @@ is handled automatically by LiteLLM.
 import asyncio
 import json
 import logging
-import os
 import time
 from contextlib import AbstractAsyncContextManager, nullcontext
 from functools import lru_cache
 from typing import Any, Callable
 
-from hindsight_api.config import DEFAULT_LLM_TIMEOUT, ENV_LLM_TIMEOUT
+from hindsight_api.config import get_config
 from hindsight_api.engine.llm_interface import (
     LLM_TOOL_CHOICE_AUTO,
     LLMInterface,
@@ -36,6 +35,8 @@ from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult,
 from hindsight_api.engine.structured_output import provider_json_schema, strict_json_schema
 from hindsight_api.metrics import get_metrics_collector
 from hindsight_api.worker.stage import set_stage
+
+from ..response_models import LLMCallResult
 
 
 @lru_cache(maxsize=1)
@@ -134,7 +135,7 @@ class LiteLLMLLM(LLMInterface):
         super().__init__(provider, api_key, base_url, model, reasoning_effort, **kwargs)
         # ``None`` falls back to HINDSIGHT_API_LLM_TIMEOUT, then DEFAULT_LLM_TIMEOUT — never None,
         # so the hard ``asyncio.wait_for`` backstop in ``call`` is always bounded.
-        self.timeout = timeout if timeout is not None else float(os.getenv(ENV_LLM_TIMEOUT, str(DEFAULT_LLM_TIMEOUT)))
+        self.timeout = timeout if timeout is not None else get_config().llm_timeout
         self._litellm: Any = None
         # User-configured extra params merged as top-level kwargs into every
         # completion call so LiteLLM normalizes them per-provider (e.g. maps
@@ -296,9 +297,8 @@ class LiteLLMLLM(LLMInterface):
         max_backoff: float = 60.0,
         skip_validation: bool = False,
         strict_schema: bool = False,
-        return_usage: bool = False,
         attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
-    ) -> Any:
+    ) -> LLMCallResult:
         start_time = time.time()
 
         call_kwargs = self._build_common_kwargs(messages, max_completion_tokens, temperature)
@@ -442,14 +442,12 @@ class LiteLLMLLM(LLMInterface):
                         f"time={duration:.3f}s"
                     )
 
-                if return_usage:
-                    token_usage = TokenUsage(
-                        input_tokens=input_tokens,
-                        output_tokens=output_tokens,
-                        total_tokens=total_tokens,
-                    )
-                    return result, token_usage
-                return result
+                token_usage = TokenUsage(
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    total_tokens=total_tokens,
+                )
+                return LLMCallResult(content=result, usage=token_usage)
 
             except OutputTooLongError:
                 raise

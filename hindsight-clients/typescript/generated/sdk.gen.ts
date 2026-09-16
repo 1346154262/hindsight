@@ -95,6 +95,9 @@ import type {
   GetAgentStatsData,
   GetAgentStatsErrors,
   GetAgentStatsResponses,
+  GetBankAttachmentData,
+  GetBankAttachmentErrors,
+  GetBankAttachmentResponses,
   GetBankConfigData,
   GetBankConfigErrors,
   GetBankConfigResponses,
@@ -206,6 +209,9 @@ import type {
   LlmRequestStatsResponses,
   MetricsEndpointMetricsGetData,
   MetricsEndpointMetricsGetResponses,
+  PreviewPromptData,
+  PreviewPromptErrors,
+  PreviewPromptResponses,
   RecallMemoriesData,
   RecallMemoriesErrors,
   RecallMemoriesResponses,
@@ -394,6 +400,23 @@ export const dryRunExtractMemories = <ThrowOnError extends boolean = false>(
     ThrowOnError
   >({
     url: "/v1/default/banks/{bank_id}/memories/dry-run-extract",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Preview an operation's prompts (no LLM call)
+ *
+ * Render the exact system and user messages retain, consolidation or reflect would send for this bank, without calling an LLM, reading memories, or changing anything. Everything that shapes the prompt comes from the bank; the runtime data an operation would be given is a fixed placeholder. Both messages are returned: retain and consolidation keep their system prompt bank-agnostic (one provider-side cache serves every bank) and carry the mission in the user message instead.
+ */
+export const previewPrompt = <ThrowOnError extends boolean = false>(
+  options: Options<PreviewPromptData, ThrowOnError>
+) =>
+  (options.client ?? client).post<PreviewPromptResponses, PreviewPromptErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/prompts/preview",
     ...options,
     headers: {
       "Content-Type": "application/json",
@@ -1029,7 +1052,9 @@ export const getDocument = <ThrowOnError extends boolean = false>(
  *
  * Update mutable fields on a document without re-processing its content.
  *
- * **Tags** (`tags`): Propagated to all associated memory units. Observations derived from those units are invalidated and queued for re-consolidation under the new tags. Co-source memories from other documents that shared those observations are also reset.
+ * **Tags** (`tags`): The array REPLACES the document's tags, it is not merged into them — send the complete set you want the document to end up with, and any tag you leave out is dropped. An empty array (`[]`) therefore clears every tag; only omitting the field entirely is rejected (422).
+ *
+ * The new tags are propagated to all associated memory units. Observations derived from those units are invalidated and queued for re-consolidation under the new tags. Co-source memories from other documents that shared those observations are also reset. Tags are compared as a set, so re-sending the tags a document already has (in any order) changes nothing and queues no re-consolidation.
  *
  * At least one field must be provided.
  */
@@ -1085,9 +1110,9 @@ export const listOperations = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * Cancel a pending async operation
+ * Cancel a pending or in-flight async operation
  *
- * Cancel a pending async operation by removing it from the queue
+ * Cancel a queued or running async operation. A 'pending' operation is never started. A 'processing' one is cancelled cooperatively: the row is marked 'cancelled' immediately and the worker running it stops at its next checkpoint, so work already in flight may finish the batch it is on. This also clears operations stranded in 'processing' by a crashed worker. Returns 409 for operations that already reached a terminal state.
  */
 export const cancelOperation = <ThrowOnError extends boolean = false>(
   options: Options<CancelOperationData, ThrowOnError>
@@ -1138,9 +1163,9 @@ export const deleteOperation = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * Get memory bank profile
+ * Get memory bank profile (removed — use GET .../config)
  *
- * Get disposition traits and mission for a memory bank. Returns 404 if the bank does not exist.
+ * **Removed.** The bank profile endpoints have been removed. Disposition traits and the reflect mission are bank configuration: read them from GET /v1/default/banks/{bank_id}/config as `disposition_skepticism`, `disposition_literalism`, `disposition_empathy` and `reflect_mission`, and write them with PATCH /v1/default/banks/{bank_id}/config. The `name` field this endpoint also returned was a display-only label; read it from GET /v1/default/banks.
  *
  * @deprecated
  */
@@ -1153,9 +1178,9 @@ export const getBankProfile = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * Update memory bank disposition
+ * Update memory bank disposition (removed — use PATCH .../config)
  *
- * Update bank's disposition traits (skepticism, literalism, empathy)
+ * **Removed.** The bank profile endpoints have been removed. Disposition traits and the reflect mission are bank configuration: read them from GET /v1/default/banks/{bank_id}/config as `disposition_skepticism`, `disposition_literalism`, `disposition_empathy` and `reflect_mission`, and write them with PATCH /v1/default/banks/{bank_id}/config. The `name` field this endpoint also returned was a display-only label; read it from GET /v1/default/banks.
  *
  * @deprecated
  */
@@ -1176,9 +1201,9 @@ export const updateBankDisposition = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * Add/merge memory bank background (deprecated)
+ * Add/merge memory bank background (removed — use PATCH .../config)
  *
- * Deprecated: Use PUT /mission instead. This endpoint now updates the mission field.
+ * **Removed.** The bank background was folded into the reflect mission. Write it with PATCH /v1/default/banks/{bank_id}/config as `reflect_mission`. That call replaces the value rather than merging into it, so read the current mission from GET .../config first if you relied on this endpoint's append behaviour.
  *
  * @deprecated
  */
@@ -1261,7 +1286,14 @@ export const importBankTemplate = <ThrowOnError extends boolean = false>(
     ImportBankTemplateResponses,
     ImportBankTemplateErrors,
     ThrowOnError
-  >({ url: "/v1/default/banks/{bank_id}/import", ...options });
+  >({
+    url: "/v1/default/banks/{bank_id}/import",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
 
 /**
  * Export bank template
@@ -1325,6 +1357,20 @@ export const exportDocuments = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Fetch an attachment retained inline with a document
+ *
+ * Serve the bytes of an attachment retained as inline content. The id is the one inside a placeholder token, and is returned on `attachments[].url` by recall and by the document/chunk/memory reads — so an agent can show or reason over the original behind an attachment-derived fact.
+ *
+ * Bytes are served with the Content-Type the caller declared at retain. Access is authorized against the bank; a missing attachment and an invisible bank both return 404, so the endpoint cannot be used to probe what a bank holds.
+ */
+export const getBankAttachment = <ThrowOnError extends boolean = false>(
+  options: Options<GetBankAttachmentData, ThrowOnError>
+) =>
+  (options.client ?? client).get<GetBankAttachmentResponses, GetBankAttachmentErrors, ThrowOnError>(
+    { url: "/v1/default/banks/{bank_id}/attachments/{attachment_id}", ...options }
+  );
+
+/**
  * Download a stored file (async export archive)
  *
  * Stream a file previously written to file storage — currently the transfer ZIP produced by an async document export. The key comes from the export operation's result_metadata (storage_key / download_url). Access is authorized against the bank the key belongs to.
@@ -1367,7 +1413,7 @@ export const clearObservations = <ThrowOnError extends boolean = false>(
 /**
  * List observation scopes
  *
- * Enumerate the distinct scopes across a bank's observations. Each observation lives under a scope: the exact set of tags it was consolidated with. Returns every distinct scope (tag order normalized) with the number of observations in it; the empty tag list is the global/untagged scope. Use a returned scope with the graph endpoint (tags=<scope> & tags_match=exact) to filter observations to exactly that scope.
+ * Enumerate the distinct scopes across a bank's observations. Each observation lives under a scope: the exact set of tags it was consolidated with. Returns every distinct scope (tag order normalized) with the number of observations in it; the empty tag list is the global/untagged scope. Use a returned scope with the graph endpoint (tags=<scope> & tags_match=exact) to filter observations to exactly that scope. Paged: `total` reports every distinct scope in the bank.
  */
 export const listObservationScopes = <ThrowOnError extends boolean = false>(
   options: Options<ListObservationScopesData, ThrowOnError>
@@ -1422,7 +1468,7 @@ export const resetBankConfig = <ThrowOnError extends boolean = false>(
 /**
  * Get bank configuration
  *
- * Get fully resolved configuration for a bank including all hierarchical overrides (global → tenant → bank). The 'config' field contains all resolved config values. The 'overrides' field shows only bank-specific overrides.
+ * Get fully resolved configuration for a bank including all hierarchical overrides (global → tenant → bank). The 'config' field contains all resolved config values. The 'overrides' field shows only bank-specific overrides. Always available: HINDSIGHT_API_ENABLE_BANK_CONFIG_API gates only the write operations on this resource.
  */
 export const getBankConfig = <ThrowOnError extends boolean = false>(
   options: Options<GetBankConfigData, ThrowOnError>
@@ -1475,7 +1521,7 @@ export const triggerConsolidation = <ThrowOnError extends boolean = false>(
 /**
  * List webhooks
  *
- * List all webhooks registered for a bank.
+ * List the webhooks registered for a bank, oldest first. Paged: `total` reports every webhook on the bank.
  */
 export const listWebhooks = <ThrowOnError extends boolean = false>(
   options: Options<ListWebhooksData, ThrowOnError>

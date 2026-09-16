@@ -1,6 +1,10 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { createRequire } from "module";
+import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import {
+  knowledgeToolDetails,
   stripMemoryTags,
   extractRecallQuery,
   formatCurrentTimeForRecall,
@@ -12,6 +16,7 @@ import {
   buildRetainRequest,
   getDocumentIdBootToken,
   meetsMinimumVersion,
+  sessionEndMessagesFromTranscript,
   parseHindsightApiCapabilities,
   supportsAppendFromCapabilities,
   supportsAsyncRetainOperationIdFromCapabilities,
@@ -30,8 +35,11 @@ import {
   stripInlineRetainTags,
   stripInlineTimestampPrefix,
   stripRuntimeEnvelope,
+  stripMetadataEnvelopes,
+  extractSenderIdFromText,
   configureSenderPrefixStripping,
   getPluginConfig,
+  scopeClient,
   formatHookPerf,
   DEFAULT_RETAIN_CONTEXT,
 } from "./index.js";
@@ -1317,6 +1325,12 @@ describe("session identity helpers", () => {
     });
   });
 
+  it("parses Control UI Dashboard sessions", () => {
+    expect(parseSessionKey("agent:main:dashboard:12345678-90ab-cdef-1234-567890abcdef")).toEqual({
+      agentId: "main",
+    });
+  });
+
   it("extracts telegram direct sender ids from channel ids", () => {
     expect(extractTelegramDirectSenderId("direct:12345")).toBe("12345");
     expect(extractTelegramDirectSenderId("group:12345")).toBeUndefined();
@@ -1463,6 +1477,38 @@ describe("session identity helpers", () => {
     );
     expect(result.reason).toBeUndefined();
     expect(result.resolvedCtx?.senderId).toBe("agent-user:main");
+  });
+
+  it("allows Dashboard sessions through when a static bankId is configured", () => {
+    const result = resolveAndCacheIdentity({
+      sessionKey: "agent:main:dashboard:12345678-90ab-cdef-1234-567890abcdef",
+      ctx: { sessionKey: "agent:main:dashboard:12345678-90ab-cdef-1234-567890abcdef" },
+      dispatchChannel: "webchat",
+      pluginConfig: { dynamicBankId: false, bankId: "shared-bank" },
+    });
+
+    expect(result.skipReason).toBeUndefined();
+    expect(result.resolvedCtx).toEqual({
+      sessionKey: "agent:main:dashboard:12345678-90ab-cdef-1234-567890abcdef",
+      agentId: "main",
+      messageProvider: "webchat",
+      channelId: undefined,
+      senderId: "agent-user:main",
+    });
+  });
+
+  it("does not synthesize a Dashboard sender when agent and static banking are disabled", () => {
+    const result = resolveAndCacheIdentity({
+      sessionKey: "agent:main:dashboard:12345678-90ab-cdef-1234-567890abcdee",
+      ctx: { sessionKey: "agent:main:dashboard:12345678-90ab-cdef-1234-567890abcdee" },
+      dispatchChannel: "webchat",
+      pluginConfig: { dynamicBankGranularity: ["channel", "user"] },
+    });
+
+    expect(result.skipReason).toEqual({
+      kind: "retryable",
+      detail: "missing stable sender identity",
+    });
   });
 
   it("allows agent:*:main when dynamicBankId is false but bankId is missing (default granularity includes 'agent')", () => {
@@ -1862,6 +1908,28 @@ describe("getPluginConfig — preferObservations (#2977)", () => {
   });
 });
 
+describe("recallMinScores (#4143)", () => {
+  it("passes configured score floors through plugin config", () => {
+    const recallMinScores = { semantic: 0.2, reranker: 0.3, final: null };
+    expect(getPluginConfig(makeApi({ recallMinScores })).recallMinScores).toEqual(recallMinScores);
+  });
+
+  it("passes score floors to the Hindsight client", async () => {
+    const recall = vi.fn().mockResolvedValue({ results: [] });
+    const scoped = scopeClient({ recall } as never, "test-bank");
+
+    await scoped.recall({ query: "test", minScores: { reranker: 0.3 } });
+
+    expect(recall).toHaveBeenCalledWith("test-bank", "test", {
+      maxTokens: undefined,
+      budget: undefined,
+      types: undefined,
+      preferObservations: undefined,
+      minScores: { reranker: 0.3 },
+    });
+  });
+});
+
 describe("formatHookPerf (#1406)", () => {
   it("emits the hook name, total ms, and field key=value pairs", () => {
     const line = formatHookPerf("before_prompt_build", 4200, {
@@ -2219,5 +2287,176 @@ describe("senderPrefixPattern display-name stripping (#3070)", () => {
     expect(stripRuntimeEnvelope("UserName: today weather?")).toBe("UserName: today weather?");
 
     expect(getPluginConfig(makeApi({})).senderPrefixPattern).toBeUndefined();
+  });
+});
+
+// OpenClaw 2026.8.1 replaced the "(untrusted metadata)" label on every injected
+// inbound context header with a `⟦openclaw:ctx⟧` provenance marker. Both forms
+// have to keep working: hosts on either side of that change are in the field.
+describe("inbound metadata blocks (marker and legacy forms)", () => {
+  const MARKER = "⟦openclaw:ctx⟧";
+  const markerBlock = (label: string, json: string) =>
+    `${label} ${MARKER}\n\`\`\`json\n${json}\n\`\`\``;
+  const legacyBlock = (label: string, json: string) =>
+    `${label} (untrusted metadata):\n\`\`\`json\n${json}\n\`\`\``;
+
+  it("extracts sender_id from a marker-form Conversation info block", () => {
+    const text = `${markerBlock("Conversation info:", '{"message_id":"om_abc","sender_id":"ou_xyz"}')}\n\nwhat did I say about postgres?`;
+    expect(extractSenderIdFromText(text)).toBe("ou_xyz");
+  });
+
+  it("extracts sender_id from a marker-form Sender block", () => {
+    const text = `${markerBlock("Sender:", '{"id":"ou_sender_only"}')}\n\nhello`;
+    expect(extractSenderIdFromText(text)).toBe("ou_sender_only");
+  });
+
+  it("still extracts sender_id from the legacy label", () => {
+    const text = `${legacyBlock("Conversation info", '{"sender_id":"ou_legacy"}')}\n\nhello`;
+    expect(extractSenderIdFromText(text)).toBe("ou_legacy");
+  });
+
+  it("strips a marker-form block from retained content", () => {
+    const text = `${markerBlock("Conversation info:", '{"sender_id":"ou_xyz"}')}\n\nremember I use pnpm`;
+    expect(stripMetadataEnvelopes(text)).toBe("remember I use pnpm");
+  });
+
+  it("strips a marker-form block that has no json fence", () => {
+    const text = `Chat history since last reply: ${MARKER}\nalice: hi\nbob: hey\n\nremember I use pnpm`;
+    expect(stripMetadataEnvelopes(text)).toBe("remember I use pnpm");
+  });
+
+  it("strips several marker-form blocks and keeps the user text", () => {
+    const text = [
+      markerBlock("Conversation info:", '{"sender_id":"ou_xyz"}'),
+      "",
+      markerBlock("Location:", '{"city":"Milan"}'),
+      "",
+      "what is the plan?",
+    ].join("\n");
+    expect(stripMetadataEnvelopes(text)).toBe("what is the plan?");
+  });
+
+  it("still strips the legacy label form", () => {
+    const text = `${legacyBlock("Conversation info", '{"sender_id":"ou_legacy"}')}\n\nremember I use pnpm`;
+    expect(stripMetadataEnvelopes(text)).toBe("remember I use pnpm");
+  });
+
+  it("leaves ordinary user text untouched", () => {
+    expect(stripMetadataEnvelopes("just a normal message")).toBe("just a normal message");
+  });
+
+  it("rejects a marker-only prompt as a recall query", () => {
+    const text = markerBlock("Conversation info:", '{"sender_id":"ou_xyz"}');
+    expect(extractRecallQuery(text, undefined)).toBeNull();
+  });
+
+  it("recovers the user query from a marker-wrapped prompt", () => {
+    const text = `${markerBlock("Conversation info:", '{"sender_id":"ou_xyz"}')}\n\nwhat did I say about postgres?`;
+    expect(extractRecallQuery(undefined, text)).toBe("what did I say about postgres?");
+  });
+});
+
+// ── #4341: session_end carries no transcript ────────────────────────────────
+// OpenClaw's buildSessionEndHookPayload() sends sessionId/messageCount/reason/
+// sessionFile and nothing else, so the forced flush added for #1726 ended at its own
+// "no messages" guard on every session close and the turns after the last cadence
+// boundary were never retained.
+describe("sessionEndMessagesFromTranscript", () => {
+  const madeDirs: string[] = [];
+  const writeTranscript = (lines: unknown[]): string => {
+    const dir = mkdtempSync(join(tmpdir(), "hs-session-end-"));
+    madeDirs.push(dir);
+    const file = join(dir, "sess-1.jsonl");
+    writeFileSync(file, lines.map((line) => JSON.stringify(line)).join("\n") + "\n");
+    return file;
+  };
+  afterEach(() => {
+    for (const dir of madeDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  const sessionEndEvent = (sessionFile?: string) => ({
+    // The real payload shape: ids and counts, no messages array.
+    sessionId: "sess-1",
+    sessionKey: "agent:main:telegram:group:1",
+    messageCount: 4,
+    durationMs: 12_000,
+    reason: "reset",
+    ...(sessionFile === undefined ? {} : { sessionFile }),
+    context: { sessionId: "sess-1", sessionKey: "agent:main:telegram:group:1", agentId: "main" },
+  });
+
+  it("reads the transcript the event points at", () => {
+    const file = writeTranscript([
+      { type: "session", id: "sess-1", timestamp: "2026-09-12T20:00:00Z" },
+      { type: "message", message: { role: "user", content: "where were we" } },
+      { type: "message", message: { role: "assistant", content: "the tail of the session" } },
+    ]);
+
+    const messages = sessionEndMessagesFromTranscript(sessionEndEvent(file)) as Array<{
+      role: string;
+      content: unknown;
+    }>;
+
+    expect(messages).toHaveLength(2);
+    expect(messages[0].role).toBe("user");
+    expect(messages[1].content).toBe("the tail of the session");
+  });
+
+  it("returns undefined when the event points at no transcript", () => {
+    expect(sessionEndMessagesFromTranscript(sessionEndEvent())).toBeUndefined();
+  });
+
+  it("returns undefined for an unreadable transcript instead of throwing", () => {
+    const file = writeTranscript([{ type: "session", id: "sess-1" }]);
+    rmSync(file);
+    expect(sessionEndMessagesFromTranscript(sessionEndEvent(file))).toBeUndefined();
+  });
+
+  it("returns undefined when the transcript holds no messages", () => {
+    // The caller's own guard then skips the flush, exactly as before.
+    const file = writeTranscript([
+      { type: "session", id: "sess-1" },
+      { type: "message", message: { role: "user", content: "   " } },
+    ]);
+    expect(sessionEndMessagesFromTranscript(sessionEndEvent(file))).toBeUndefined();
+  });
+
+  it("passes the agent id from the event context to the reader", () => {
+    const seen: string[] = [];
+    const read = ((filePath: string, agentId: string) => {
+      seen.push(agentId);
+      return { filePath, agentId, sessionId: "s", messages: [{ role: "user", content: "hi" }] };
+    }) as never;
+
+    sessionEndMessagesFromTranscript(sessionEndEvent("/tmp/whatever.jsonl"), read);
+
+    expect(seen).toEqual(["main"]);
+  });
+});
+
+describe("knowledgeToolDetails — Code Mode structured result (#4308)", () => {
+  it("parses the SDK's JSON text payload into details", () => {
+    const result = {
+      content: [
+        { type: "text", text: JSON.stringify({ results: [{ id: "m1", text: "fact" }] }, null, 2) },
+      ],
+    };
+    expect(knowledgeToolDetails(result)).toEqual({ results: [{ id: "m1", text: "fact" }] });
+  });
+
+  it("wraps a non-object payload so the guest still receives it", () => {
+    expect(knowledgeToolDetails({ content: [{ type: "text", text: "[1,2]" }] })).toEqual({
+      result: [1, 2],
+    });
+    expect(knowledgeToolDetails({ content: [{ type: "text", text: '"ok"' }] })).toEqual({
+      result: "ok",
+    });
+  });
+
+  it("falls back to an empty object for missing or unparseable text", () => {
+    expect(knowledgeToolDetails({ content: [{ type: "text", text: "not json" }] })).toEqual({});
+    expect(knowledgeToolDetails({ content: [] })).toEqual({});
+    expect(knowledgeToolDetails({})).toEqual({});
+    expect(knowledgeToolDetails(undefined)).toEqual({});
   });
 });

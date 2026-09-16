@@ -182,7 +182,7 @@ def unlock_file(file_obj: IO[str]) -> None:
     _release_lock(file_obj)
 
 
-import httpx
+from ._http_probe import probe_get
 
 # Configuration paths
 CONFIG_DIR = Path.home() / ".hindsight"
@@ -591,8 +591,15 @@ class ProfileManager:
             name: Profile name (empty string for default).
 
         Returns:
-            Dictionary of environment variable key-value pairs from the profile's .env file.
-            Also includes simple key aliases (e.g., 'idle_timeout' for 'HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT').
+            Dictionary of environment variable key-value pairs from the profile's
+            .env file, under their own names.
+
+            This used to also inject lowercase aliases ('llm_base_url' for
+            'HINDSIGHT_API_LLM_BASE_URL', and five others). Every consumer then
+            had to strip them back out before writing a profile, and the alias
+            table was a second place a setting had to be listed to be seen at
+            all — which is how HINDSIGHT_API_LLM_BASE_URL went missing (issue
+            #4094). Callers now read the environment variable names directly.
         """
         paths = self.resolve_profile_paths(name)
         config = {}
@@ -614,21 +621,6 @@ class ProfileManager:
                 if "=" in line:
                     key, value = line.split("=", 1)
                     config[key.strip()] = value.strip()
-
-        # Add simple key aliases for backward compatibility
-        # Some code checks config.get("idle_timeout") instead of the full env var name
-        key_aliases = {
-            "HINDSIGHT_API_LLM_API_KEY": "llm_api_key",
-            "HINDSIGHT_API_LLM_PROVIDER": "llm_provider",
-            "HINDSIGHT_API_LLM_MODEL": "llm_model",
-            "HINDSIGHT_API_LLM_BASE_URL": "llm_base_url",
-            "HINDSIGHT_API_LOG_LEVEL": "log_level",
-            "HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT": "idle_timeout",
-        }
-
-        for env_key, simple_key in key_aliases.items():
-            if env_key in config and simple_key not in config:
-                config[simple_key] = config[env_key]
 
         return config
 
@@ -687,12 +679,8 @@ class ProfileManager:
         Returns:
             True if daemon is responding.
         """
-        try:
-            with httpx.Client() as client:
-                response = client.get(f"http://127.0.0.1:{port}/health", timeout=1)
-                return response.status_code == 200
-        except Exception:
-            return False
+        response = probe_get(f"http://127.0.0.1:{port}/health", read_timeout=1.0)
+        return response is not None and response.status_code == 200
 
     def _load_metadata(self) -> ProfileMetadata:
         """Load profile metadata from disk.

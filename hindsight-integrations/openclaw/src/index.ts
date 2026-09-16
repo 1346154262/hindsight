@@ -7,9 +7,14 @@ import type {
   RetainRequest,
 } from "./types.js";
 import { HindsightServer, type Logger } from "@vectorize-io/hindsight-all";
-import { HindsightClient, type HindsightClientOptions } from "@vectorize-io/hindsight-client";
+import {
+  HindsightClient,
+  type HindsightClientOptions,
+  type MinScores,
+} from "@vectorize-io/hindsight-client";
 import { RetainQueue } from "./retain-queue.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
+import { parseSessionFile } from "./session-file.js";
 import { createHash, randomUUID } from "crypto";
 import { dirname, join } from "path";
 import * as log from "./logger.js";
@@ -25,6 +30,31 @@ import {
   normalizeEntityLabels,
   normalizeRetainExtractionMode,
 } from "./bank-defaults.js";
+
+/**
+ * Structured payload for a knowledge tool result.
+ *
+ * The SDK returns the payload only as JSON text in `content[0].text`. OpenClaw's
+ * Code Mode hands a tool result's `details` (and nothing else) to the guest as the
+ * structured value, so `details: {}` made every knowledge tool look empty there
+ * (#4308). Parse the text back into an object; a non-object payload is wrapped and
+ * unparseable text yields `{}` as before.
+ */
+export function knowledgeToolDetails(result: unknown): Record<string, unknown> {
+  const content = (result as { content?: unknown })?.content;
+  const first = Array.isArray(content) ? (content[0] as { text?: unknown } | undefined) : undefined;
+  const text = first?.text;
+  if (typeof text !== "string") return {};
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+    return { result: parsed };
+  } catch {
+    return {};
+  }
+}
 
 function loadPackageVersion(): string {
   try {
@@ -129,6 +159,7 @@ export interface BankScopedClient {
       budget?: "low" | "mid" | "high";
       types?: Array<"world" | "experience" | "observation">;
       preferObservations?: boolean;
+      minScores?: MinScores;
     },
     timeoutMs?: number
   ): Promise<RecallResponse>;
@@ -162,6 +193,7 @@ export function scopeClient(c: HindsightClient, bankId: string): BankScopedClien
         budget: req.budget,
         types: req.types,
         preferObservations: req.preferObservations,
+        minScores: req.minScores,
       });
       if (!timeoutMs) return call;
       // The generated client doesn't accept a per-call AbortSignal, so we race
@@ -441,6 +473,42 @@ export async function flushRetainQueue(
 const DEFAULT_RECALL_PROMPT_PREAMBLE =
   "Relevant memories from past conversations (prioritize recent when conflicting). Only use memories that are directly useful to continue this conversation; ignore the rest:";
 
+/**
+ * The messages a retain should work from, for a `session_end` event that carries none.
+ *
+ * OpenClaw's `buildSessionEndHookPayload()` sends `sessionId`, `sessionKey`,
+ * `messageCount`, `durationMs`, `reason`, `sessionFile` and the next session's ids -
+ * no `messages` array, and a `context` holding only ids. The forced flush added for
+ * #1726 therefore ended at its own "no messages" guard on every session close, and the
+ * turns after the last cadence boundary were never retained (#4341).
+ *
+ * The transcript the event points at is the source: one synchronous read, which is what
+ * the shutdown drain's shared 2s budget allows, and extraction still happens
+ * asynchronously in the bank's operation queue. `undefined` when there is no readable
+ * transcript, which leaves the caller's existing guard to skip the flush as before.
+ *
+ * `/new` matters here: OpenClaw emits the previous session's `session_end` lazily, on
+ * the first turn of its successor, so the old messages are gone from the live session
+ * entry by then and the file is the only copy.
+ */
+export function sessionEndMessagesFromTranscript(
+  event: unknown,
+  read: typeof parseSessionFile = parseSessionFile
+): unknown[] | undefined {
+  const payload = (event ?? {}) as Record<string, any>;
+  const sessionFile = typeof payload.sessionFile === "string" ? payload.sessionFile : undefined;
+  if (!sessionFile) return undefined;
+  const agentId = typeof payload.context?.agentId === "string" ? payload.context.agentId : "";
+  try {
+    const messages = read(sessionFile, agentId).messages;
+    return messages.length > 0 ? messages : undefined;
+  } catch {
+    // A missing, truncated or unreadable transcript is not an error worth failing the
+    // session close over; the caller skips the flush exactly as it did before.
+    return undefined;
+  }
+}
+
 export function formatCurrentTimeForRecall(date = new Date()): string {
   const year = date.getUTCFullYear();
   const month = String(date.getUTCMonth() + 1).padStart(2, "0");
@@ -671,22 +739,95 @@ export function stripInlineTimestampPrefix(content: string): string {
 }
 
 /**
+ * Provenance marker OpenClaw appends to every injected inbound context header
+ * since 2026.8.1 — e.g. `Conversation info: ⟦openclaw:ctx⟧`. Older hosts label
+ * the same blocks `Conversation info (untrusted metadata):` instead. Both forms
+ * are recognised: the plugin has to keep working against hosts on either side
+ * of that change.
+ */
+const INBOUND_CONTEXT_MARKER = "⟦openclaw:ctx⟧";
+
+/** Matches a header line in either the marker (2026.8.1+) or legacy form. */
+const INBOUND_META_HEADER_RE = new RegExp(
+  `^[^\\n]*(?:${INBOUND_CONTEXT_MARKER}|\\(untrusted metadata\\))[^\\n]*$`
+);
+
+/** True when `line` opens an OpenClaw-injected inbound metadata block. */
+function isInboundMetaHeaderLine(line: string): boolean {
+  return INBOUND_META_HEADER_RE.test(line.trim());
+}
+
+interface InboundMetaBlock {
+  /** Index of the header line's first character. */
+  start: number;
+  /** Index just past the block (header + body), i.e. where normal text resumes. */
+  end: number;
+  /** Parsed body when the block is a ```json fence, otherwise undefined. */
+  json?: unknown;
+}
+
+/**
+ * Locate every OpenClaw-injected inbound metadata block in `text`.
+ *
+ * Mirrors the host's own stripper: a header line is followed either by a
+ * ```json fence (block ends at the closing fence) or by free-form lines that
+ * end at the first blank line. Keying on the header rather than on a fenced
+ * payload is what makes marker-form blocks like `Chat history since last
+ * reply: ⟦openclaw:ctx⟧` strippable too.
+ */
+function findInboundMetaBlocks(text: string): InboundMetaBlock[] {
+  if (!text) return [];
+  const lines = text.split("\n");
+  // Byte offset of the start of each line, plus a terminator past the end.
+  const offsets: number[] = [];
+  let cursor = 0;
+  for (const line of lines) {
+    offsets.push(cursor);
+    cursor += line.length + 1;
+  }
+  offsets.push(cursor);
+
+  const blocks: InboundMetaBlock[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!isInboundMetaHeaderLine(lines[i])) continue;
+    const start = offsets[i];
+    let end: number;
+    let json: unknown;
+    if (lines[i + 1]?.trim() === "```json") {
+      let close = i + 2;
+      while (close < lines.length && lines[close].trim() !== "```") close++;
+      if (close < lines.length) {
+        try {
+          json = JSON.parse(lines.slice(i + 2, close).join("\n"));
+        } catch {
+          // Leave `json` undefined; the block is still stripped.
+        }
+      }
+      end = offsets[Math.min(close + 1, lines.length)];
+      i = close;
+    } else {
+      let blank = i + 1;
+      while (blank < lines.length && lines[blank].trim() !== "") blank++;
+      end = offsets[Math.min(blank + 1, lines.length)];
+      i = blank;
+    }
+    blocks.push({ start, end, json });
+  }
+  return blocks;
+}
+
+/**
  * Extract sender_id from OpenClaw's injected inbound metadata blocks.
- * Checks both "Conversation info (untrusted metadata)" and "Sender (untrusted metadata)" blocks.
+ * Reads both "Conversation info" and "Sender" blocks, in either the 2026.8.1+
+ * `⟦openclaw:ctx⟧` marker form or the legacy "(untrusted metadata)" form.
  * Returns the first sender_id / id string found, or undefined if none.
  */
 export function extractSenderIdFromText(text: string): string | undefined {
   if (!text) return undefined;
-  const metaBlockRe = /[\w\s]+\(untrusted metadata\)[^\n]*\n```json\n([\s\S]*?)\n```/gi;
-  let match: RegExpExecArray | null;
-  while ((match = metaBlockRe.exec(text)) !== null) {
-    try {
-      const obj = JSON.parse(match[1]);
-      const id = obj?.sender_id ?? obj?.id;
-      if (id && typeof id === "string") return id;
-    } catch {
-      // continue to next block
-    }
+  for (const block of findInboundMetaBlocks(text)) {
+    const obj = block.json as { sender_id?: unknown; id?: unknown } | undefined;
+    const id = obj?.sender_id ?? obj?.id;
+    if (typeof id === "string" && id) return id;
   }
   return undefined;
 }
@@ -696,12 +837,20 @@ export function extractSenderIdFromText(text: string): string | undefined {
  * These blocks are injected by OpenClaw but are noise for memory storage and recall.
  */
 export function stripMetadataEnvelopes(content: string): string {
-  // Strip: ---\n<Label> (untrusted metadata):\n```json\n{...}\n```\n<message>\n---
-  content = content
-    .replace(/^---\n[\w\s]+\(untrusted metadata\)[^\n]*\n```json[\s\S]*?```\n\n?/im, "")
-    .replace(/\n---$/, "");
-  // Strip: <Label> (untrusted metadata):\n```json\n{...}\n```  (without --- wrapper)
-  content = content.replace(/[\w\s]+\(untrusted metadata\)[^\n]*\n```json[\s\S]*?```\n?/gim, "");
+  if (!content) return content;
+  const blocks = findInboundMetaBlocks(content);
+  if (blocks.length > 0) {
+    const parts: string[] = [];
+    let cursor = 0;
+    for (const block of blocks) {
+      parts.push(content.slice(cursor, Math.max(cursor, block.start)));
+      cursor = Math.max(cursor, block.end);
+    }
+    parts.push(content.slice(cursor));
+    content = parts.join("");
+  }
+  // Drop the `---` fences that wrapped the legacy envelope form.
+  content = content.replace(/^---\n/, "").replace(/\n---$/, "");
   return stripRuntimeEnvelope(content).trim();
 }
 
@@ -778,7 +927,10 @@ export function extractRecallQuery(
     /^\s*\(untrusted metadata\)/i,
     /^\s*system:/i,
   ];
-  const isMetadata = (s: string) => METADATA_PATTERNS.some((p) => p.test(s));
+  const isMetadata = (s: string) =>
+    METADATA_PATTERNS.some((p) => p.test(s)) ||
+    // 2026.8.1+ marker form: a leftover header line is metadata, not a query.
+    isInboundMetaHeaderLine(s.split("\n")[0] ?? "");
 
   let recallQuery = rawMessage;
   // Strip sender metadata envelope before any checks
@@ -985,6 +1137,14 @@ export function parseSessionKey(sessionKey: string): ParsedSessionKey {
       channel: "main",
     };
   }
+  // OpenClaw's Control UI creates `agent:<id>:dashboard:<opaque-id>` keys.
+  // Recover only the agent identity: "dashboard" is a session namespace, not
+  // the live message provider used for dynamic bank routing.
+  if (parts.length === 4 && parts[2] === "dashboard") {
+    return {
+      agentId: parts[1],
+    };
+  }
   if (parts.length >= 4 && ["cron", "heartbeat", "subagent"].includes(parts[2])) {
     return {
       agentId: parts[1],
@@ -1165,9 +1325,11 @@ export function resolveAndCacheIdentity(options: ResolveAndCacheIdentityOptions)
     return { effectiveCtx, resolvedCtx, skipReason };
   }
 
-  cacheSessionIdentity(sessionKey, resolvedCtx);
-
-  const { reason: skipReason } = getIdentitySkipReason(resolvedCtx, options.pluginConfig);
+  const { resolvedCtx: identityCtx, reason: skipReason } = getIdentitySkipReason(
+    resolvedCtx,
+    options.pluginConfig
+  );
+  cacheSessionIdentity(sessionKey, identityCtx);
   if (sessionKey) {
     if (skipReason) {
       setCappedMapValue(skipHindsightTurnBySession, sessionKey, skipReason);
@@ -1176,7 +1338,7 @@ export function resolveAndCacheIdentity(options: ResolveAndCacheIdentityOptions)
     }
   }
 
-  return { effectiveCtx, resolvedCtx, skipReason };
+  return { effectiveCtx, resolvedCtx: identityCtx, skipReason };
 }
 
 export function getIdentitySkipReason(
@@ -1912,6 +2074,7 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
     recallMaxTokens: config.recallMaxTokens || 1024,
     recallTypes: Array.isArray(config.recallTypes) ? config.recallTypes : ["observation"],
     preferObservations: config.preferObservations === true, // Default: false — backward compatible
+    recallMinScores: config.recallMinScores,
     recallRoles: Array.isArray(config.recallRoles) ? config.recallRoles : ["user", "assistant"],
     retainEveryNTurns:
       typeof config.retainEveryNTurns === "number" && config.retainEveryNTurns >= 1
@@ -2561,6 +2724,7 @@ export default function (api: MoltbotPluginAPI) {
               budget: pluginConfig.recallBudget,
               types: pluginConfig.recallTypes,
               preferObservations: pluginConfig.preferObservations,
+              minScores: pluginConfig.recallMinScores,
             },
             recallTimeoutMs
           );
@@ -2774,10 +2938,20 @@ ${memoriesFormatted}
           return;
         }
 
-        if (
-          !Array.isArray(event.context?.sessionEntry?.messages ?? event.messages) ||
-          (event.context?.sessionEntry?.messages ?? event.messages ?? []).length === 0
-        ) {
+        // Resolved once: `session_end` carries no transcript, so the forced flush
+        // reads it from the file the event points at (#4341). Without this the guard
+        // below ended every session-close flush before it began.
+        let eventMessages = event.context?.sessionEntry?.messages ?? event.messages;
+        if (force && (!Array.isArray(eventMessages) || eventMessages.length === 0)) {
+          eventMessages = sessionEndMessagesFromTranscript(event);
+          if (Array.isArray(eventMessages)) {
+            debug(
+              `[Hindsight Hook] session_end: read ${eventMessages.length} messages from ${event.sessionFile}`
+            );
+          }
+        }
+
+        if (!Array.isArray(eventMessages) || eventMessages.length === 0) {
           debug("[Hindsight Hook] No messages in event, skipping retention");
           return;
         }
@@ -2789,7 +2963,7 @@ ${memoriesFormatted}
 
         // Chunked retention: skip non-Nth turns and use a sliding window when firing
         const retainEveryN = pluginConfig.retainEveryNTurns ?? 1;
-        const allMessages = event.context?.sessionEntry?.messages ?? event.messages ?? [];
+        const allMessages = eventMessages;
         let messagesToRetain = allMessages;
         let retainFullWindow = false;
 
@@ -3039,12 +3213,13 @@ ${memoriesFormatted}
               if (resolution.identityError) {
                 return {
                   content: [{ type: "text", text: resolution.identityError }],
-                  details: {},
+                  details: { error: resolution.identityError },
                 };
               }
               const config = currentPluginConfig || pluginConfig;
               await ensureBankDefaultsApplied(resolution.bankId, config);
-              return { ...(await t.execute(params)), details: {} };
+              const result = await t.execute(params);
+              return { ...result, details: knowledgeToolDetails(result) };
             },
           }));
         };

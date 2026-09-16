@@ -15,6 +15,7 @@
  * (core/survey.ts).
  */
 import { z } from "zod";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -23,6 +24,7 @@ import type { ZodRawShape } from "zod";
 import type { HindsightClient } from "./hindsight";
 import { syncStatus } from "./status";
 import { applyBankConfig, DEFAULT_REFLECT_TOOL_TIMEOUT_MS, loadConfig } from "./config";
+import { diagFilePath } from "./diag";
 import { describeError } from "./log";
 import type { RetainStamp } from "./retain-stamp";
 import type { PageTrigger } from "./missions";
@@ -173,7 +175,7 @@ export function buildKnowledgeTools(
             config_override: Boolean(process.env.HINDSIGHT_CONFIG),
             hooks_disabled: Boolean(process.env.HINDSIGHT_DISABLE_HOOKS),
             log_level: process.env.HINDSIGHT_LOG_LEVEL ?? null,
-            diagnostics_file: process.env.HINDSIGHT_DIAG_FILE ?? "/tmp/hindsight-plugin.log",
+            diagnostics_file: diagFilePath(),
             channel_id_configured: Boolean(process.env.HINDSIGHT_CHANNEL_ID),
             user_id_configured: Boolean(process.env.HINDSIGHT_USER_ID),
           },
@@ -194,7 +196,9 @@ export function buildKnowledgeTools(
       annotations: READ_ONLY_ANNOTATIONS,
       handler: async (args: { query: string }) => {
         try {
-          const hits = await client.searchKnowledgePages(args.query, 3);
+          // Limit comes from the client (`pageSearchLimit`), so the tool and the hook's injection
+          // can never drift apart — this used to pass its own literal 3.
+          const hits = await client.searchKnowledgePages(args.query);
           return ok(
             hits.map((h) => ({
               page: h.name,
@@ -305,11 +309,17 @@ export function buildKnowledgeTools(
       inputSchema: { title: z.string(), content: z.string() },
       annotations: NON_DESTRUCTIVE_WRITE_ANNOTATIONS,
       handler: guarded(async ({ title, content }) => {
+        const slug = title
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, "-")
+          .replace(/^-+|-+$/g, "");
+        // ASCII-only slugs erased non-Latin titles (or shared the "doc" fallback),
+        // overwriting unrelated documents. Hash the original title, not its content,
+        // so re-ingestion still updates it; "--" cannot occur in a legacy slug.
         const docId =
-          title
-            .toLowerCase()
-            .replace(/[^a-z0-9]+/g, "-")
-            .replace(/^-+|-+$/g, "") || "doc";
+          /[^\x00-\x7f]/.test(title) || !slug
+            ? `${slug || "doc"}--${createHash("sha256").update(title).digest("hex")}`
+            : slug;
         const stamp = opts.stampFor?.();
         const metadata = {
           ...stamp?.metadata,
