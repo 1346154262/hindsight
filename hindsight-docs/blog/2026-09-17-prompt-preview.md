@@ -1,5 +1,5 @@
 ---
-title: "Your Mission Isn't in the System Prompt"
+title: "See the Exact Prompt Before You Spend a Token"
 authors: [benfrank241]
 slug: "2026/09/17/prompt-preview"
 date: 2026-09-17T14:00
@@ -9,7 +9,7 @@ image: /img/blog/prompt-preview.png
 hide_table_of_contents: true
 ---
 
-![The prompt preview endpoint, showing the blocks that make up a retain prompt](/img/blog/prompt-preview.png)
+![See the exact prompt an operation would send, split into the settings that produced it](/img/blog/prompt-preview.png)
 
 You write a mission for your memory bank. Something like "focus on billing decisions and who approved them." You save it, and the extraction gets better, or it doesn't.
 
