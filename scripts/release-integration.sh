@@ -13,7 +13,7 @@ print_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 print_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
-VALID_INTEGRATIONS=("ag2" "agent-framework" "agent-plugin" "agentcore" "agno" "aider" "ai-sdk" "autogen" "chat" "claude-agent-sdk" "claude-code" "cline" "cloudflare-oauth-proxy" "coding-agents" "codex" "composio" "continue" "copilot-cli" "crewai" "cursor" "cursor-cli" "devin-desktop" "dify" "eliza" "eve" "flowise" "gemini-spark" "github-copilot" "google-adk" "haystack" "langgraph" "litellm" "llamaindex" "n8n" "nemoclaw" "obsidian" "omo" "openai-agents" "openclaw" "opencode" "openhands" "paperclip" "pipecat" "pydantic-ai" "roo-code" "smolagents" "strands" "superagent" "vapi" "zcode" "zed")
+VALID_INTEGRATIONS=("ag2" "agent-framework" "agent-plugin" "agentcore" "agno" "aider" "ai-sdk" "autogen" "chat" "claude-agent-sdk" "claude-code" "cline" "cloudflare-oauth-proxy" "coding-agents" "codex" "composio" "continue" "copilot-cli" "crewai" "cursor" "cursor-cli" "devin-desktop" "dify" "eliza" "eve" "flowise" "gemini-spark" "github-copilot" "google-adk" "haystack" "hermes" "langgraph" "litellm" "llamaindex" "n8n" "nemoclaw" "obsidian" "omo" "openai-agents" "openclaw" "opencode" "openhands" "paperclip" "pipecat" "pydantic-ai" "roo-code" "smolagents" "strands" "superagent" "vapi" "zcode" "zed")
 
 usage() {
     print_error "Usage: $0 <integration> <version>"
@@ -191,6 +191,14 @@ fi
 # reads the root .claude-plugin/marketplace.json, so its "version" must be
 # bumped in lockstep with the plugin so the published catalog reflects the new
 # release (see #2386).
+# The Hermes plugin carries its own version in plugin.yaml (what `hermes plugins`
+# reads); keep it in lockstep with pyproject.toml.
+if [ "$INTEGRATION" = "hermes" ]; then
+    print_info "Updating version in $INTEGRATION_DIR/plugin.yaml"
+    sed -i.bak "s/^version: .*/version: $VERSION/" "$INTEGRATION_DIR/plugin.yaml"
+    rm "$INTEGRATION_DIR/plugin.yaml.bak"
+fi
+
 if [ "$INTEGRATION" = "claude-code" ]; then
     MARKETPLACE_FILE=".claude-plugin/marketplace.json"
     print_info "Updating marketplace version in $MARKETPLACE_FILE"
