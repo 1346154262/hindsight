@@ -173,9 +173,6 @@ INTEGRATIONS: dict[str, IntegrationMeta] = {
     "zed": IntegrationMeta("hindsight-zed", "Zed"),
     "openhands": IntegrationMeta("hindsight-openhands", "OpenHands"),
     "devin-desktop": IntegrationMeta("hindsight-devin-desktop", "Devin Desktop"),
-    # Hermes Agent memory-provider plugin: installed from git by `hermes plugins
-    # install`, so its changelog links to the source tree (see _package_url).
-    "hermes": IntegrationMeta("hermes-plugin-hindsight", "Hermes Agent"),
 }
 
 VALID_INTEGRATIONS = list(INTEGRATIONS.keys())
@@ -1127,7 +1124,7 @@ def _get_package_name(integration: str) -> str:
 def _package_url(integration: str, package_name: str) -> str:
     # Git-distributed plugin bundles have no npm/pypi package — link to the
     # source tree instead of a registry page.
-    if integration in ("claude-code", "agent-plugin", "hermes"):
+    if integration in ("claude-code", "agent-plugin"):
         return f"https://github.com/vectorize-io/hindsight/tree/main/hindsight-integrations/{integration}"
     if package_name.startswith("@"):
         return f"https://www.npmjs.com/package/{package_name}"
