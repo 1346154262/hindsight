@@ -43,7 +43,6 @@ from ..config import (
     DEFAULT_RECALL_CHUNKS_MAX_TOKENS,
     DEFAULT_RECALL_INCLUDE_CHUNKS,
     DEFAULT_RECALL_MAX_TOKENS,
-    DEFAULT_REFLECT_LLM_TIMEOUT,
     DEFAULT_REFLECT_SOURCE_FACTS_MAX_TOKENS,
     DEFAULT_STORE_DOCUMENT_TEXT,
     ENV_MODEL_INIT_TIMEOUT,
@@ -2361,18 +2360,16 @@ class MemoryEngine(MemoryEngineInterface):
         reflect_call_defaults = _op_defaults("reflect_")
         consolidation_call_defaults = _op_defaults("consolidation_")
         mental_model_refresh_call_defaults = _op_defaults("mental_model_refresh_", fallback=reflect_call_defaults)
-        # Reflect's 30s default is sized for a caller holding a request open. A refresh
-        # runs in the background, and its final answer over a 30k-90k-token prompt
-        # cannot finish in 30s: it timed out on every retry and every tick (#4532).
-        # So when reflect is on that default and refresh sets no timeout of its own,
-        # refresh gets the global LLM timeout, like the other background operations.
-        # ponytail: an explicit REFLECT_LLM_TIMEOUT=30 reads as the default here.
-        refresh_timeout_widened = (
-            config.mental_model_refresh_llm_timeout is None
-            and config.reflect_llm_timeout == DEFAULT_REFLECT_LLM_TIMEOUT
+        # Refresh never inherits reflect's timeout. Reflect's is sized for a caller
+        # holding a request open (30s by default); a refresh runs in the background,
+        # and its final answer over a 30k-90k-token prompt cannot finish in 30s: it
+        # timed out on every retry and every tick (#4532). So refresh takes its own
+        # timeout, else the global LLM one, like the other background operations.
+        mental_model_refresh_call_defaults = replace(
+            mental_model_refresh_call_defaults,
+            timeout=config.mental_model_refresh_llm_timeout or config.llm_timeout,
         )
-        if refresh_timeout_widened:
-            mental_model_refresh_call_defaults = replace(mental_model_refresh_call_defaults, timeout=config.llm_timeout)
+        refresh_timeout_differs = mental_model_refresh_call_defaults.timeout != reflect_call_defaults.timeout
 
         # Initialize LLM configuration (default, used as fallback)
         _default_base_llm = LLMConfig(
@@ -2554,7 +2551,7 @@ class MemoryEngine(MemoryEngineInterface):
         # Only the timeout differs from reflect: see the property, which then still
         # follows a reflect provider swapped in after __init__.
         self._mental_model_refresh_llm_timeout_only = not config.has_mental_model_refresh_llm_override()
-        if self._mental_model_refresh_llm_timeout_only and not refresh_timeout_widened:
+        if self._mental_model_refresh_llm_timeout_only and not refresh_timeout_differs:
             # None, not an alias to the reflect config: callers reassign
             # ``_reflect_llm_config`` after __init__ (tests swapping in a real
             # provider, most of all), and an alias captured here would keep

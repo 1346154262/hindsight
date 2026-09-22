@@ -37,9 +37,10 @@ def engine_env(monkeypatch):
 def test_unset_reuses_the_reflect_config_object(engine_env):
     """The backwards-compatible path: same object, so no second provider is built.
 
-    Only when reflect's timeout is one the operator chose; see the next test.
+    Only when reflect and refresh end up on the same timeout — here both on the
+    global one; see the next tests.
     """
-    engine = engine_env(HINDSIGHT_API_REFLECT_LLM_TIMEOUT="45")
+    engine = engine_env(HINDSIGHT_API_LLM_TIMEOUT="60")
 
     assert engine._mental_model_refresh_llm_config is engine._reflect_llm_config
     assert get_config().has_mental_model_refresh_llm_override() is False
@@ -55,6 +56,15 @@ def test_unset_refresh_does_not_inherit_reflects_interactive_30s_default(engine_
     assert engine._reflect_llm_config.timeout == 30.0
     assert refresh.timeout == get_config().llm_timeout == 120.0
     assert refresh.model == "reflect-model"
+
+
+def test_unset_refresh_does_not_inherit_an_explicit_reflect_timeout(engine_env):
+    """Refresh never inherits reflect's timeout, not even one the operator set: that
+    one is sized for interactive reflect too."""
+    engine = engine_env(HINDSIGHT_API_REFLECT_LLM_TIMEOUT="45")
+
+    assert engine._reflect_llm_config.timeout == 45.0
+    assert engine._mental_model_refresh_llm_config.timeout == 120.0
 
 
 def test_unset_follows_a_reflect_config_swapped_in_after_init(engine_env):
@@ -98,7 +108,8 @@ def test_override_gives_the_refresh_its_own_model(engine_env):
 
 
 def test_unset_fields_fall_back_to_reflect_not_global(engine_env):
-    """Only MODEL is overridden; timeout/reasoning come from the reflect group."""
+    """Only MODEL is overridden; reasoning comes from the reflect group. The timeout
+    does not: refresh never inherits reflect's, it takes the global one."""
     engine = engine_env(
         HINDSIGHT_API_REFLECT_LLM_TIMEOUT="45",
         HINDSIGHT_API_REFLECT_LLM_REASONING_EFFORT="high",
@@ -110,7 +121,7 @@ def test_unset_fields_fall_back_to_reflect_not_global(engine_env):
     assert refresh.model == "refresh-model"
     assert refresh.provider == "mock"  # inherited from reflect
     assert refresh.reasoning_effort == "high"
-    assert refresh.timeout == 45.0
+    assert refresh.timeout == 10.0
 
 
 def test_own_timeout_wins_over_reflect(engine_env):
