@@ -35,11 +35,26 @@ def engine_env(monkeypatch):
 
 
 def test_unset_reuses_the_reflect_config_object(engine_env):
-    """The backwards-compatible path: same object, so no second provider is built."""
-    engine = engine_env()
+    """The backwards-compatible path: same object, so no second provider is built.
+
+    Only when reflect's timeout is one the operator chose; see the next test.
+    """
+    engine = engine_env(HINDSIGHT_API_REFLECT_LLM_TIMEOUT="45")
 
     assert engine._mental_model_refresh_llm_config is engine._reflect_llm_config
     assert get_config().has_mental_model_refresh_llm_override() is False
+
+
+def test_unset_refresh_does_not_inherit_reflects_interactive_30s_default(engine_env):
+    """#4532: reflect's 30s default is for a waiting caller. A background refresh's
+    final answer over a large prompt timed out on it every time, so refresh takes the
+    global LLM timeout instead — everything else still comes from reflect."""
+    engine = engine_env()
+
+    refresh = engine._mental_model_refresh_llm_config
+    assert engine._reflect_llm_config.timeout == 30.0
+    assert refresh.timeout == get_config().llm_timeout == 120.0
+    assert refresh.model == "reflect-model"
 
 
 def test_unset_follows_a_reflect_config_swapped_in_after_init(engine_env):

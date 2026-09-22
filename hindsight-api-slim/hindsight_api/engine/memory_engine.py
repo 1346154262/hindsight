@@ -43,6 +43,7 @@ from ..config import (
     DEFAULT_RECALL_CHUNKS_MAX_TOKENS,
     DEFAULT_RECALL_INCLUDE_CHUNKS,
     DEFAULT_RECALL_MAX_TOKENS,
+    DEFAULT_REFLECT_LLM_TIMEOUT,
     DEFAULT_REFLECT_SOURCE_FACTS_MAX_TOKENS,
     DEFAULT_STORE_DOCUMENT_TEXT,
     ENV_MODEL_INIT_TIMEOUT,
@@ -2360,6 +2361,18 @@ class MemoryEngine(MemoryEngineInterface):
         reflect_call_defaults = _op_defaults("reflect_")
         consolidation_call_defaults = _op_defaults("consolidation_")
         mental_model_refresh_call_defaults = _op_defaults("mental_model_refresh_", fallback=reflect_call_defaults)
+        # Reflect's 30s default is sized for a caller holding a request open. A refresh
+        # runs in the background, and its final answer over a 30k-90k-token prompt
+        # cannot finish in 30s: it timed out on every retry and every tick (#4532).
+        # So when reflect is on that default and refresh sets no timeout of its own,
+        # refresh gets the global LLM timeout, like the other background operations.
+        # ponytail: an explicit REFLECT_LLM_TIMEOUT=30 reads as the default here.
+        refresh_timeout_widened = (
+            config.mental_model_refresh_llm_timeout is None
+            and config.reflect_llm_timeout == DEFAULT_REFLECT_LLM_TIMEOUT
+        )
+        if refresh_timeout_widened:
+            mental_model_refresh_call_defaults = replace(mental_model_refresh_call_defaults, timeout=config.llm_timeout)
 
         # Initialize LLM configuration (default, used as fallback)
         _default_base_llm = LLMConfig(
@@ -2531,13 +2544,17 @@ class MemoryEngine(MemoryEngineInterface):
             **reflect_call_defaults.as_kwargs(),
         )
         self._reflect_llm_config = _build_llm(_reflect_base_llm, config, "reflect_", reflect_call_defaults)
+        self._reflect_llm_config_at_init = self._reflect_llm_config
 
         # Mental-model refresh LLM config - the automatic refresh runs the reflect
         # pipeline in the background, where a human is not waiting and the job must
         # not destabilise interactive latency. Unset means it *is* the reflect config
         # (same object, so no extra provider, no extra verification), which is the
         # backwards-compatible path (issue #4463).
-        if not config.has_mental_model_refresh_llm_override():
+        # Only the timeout differs from reflect: see the property, which then still
+        # follows a reflect provider swapped in after __init__.
+        self._mental_model_refresh_llm_timeout_only = not config.has_mental_model_refresh_llm_override()
+        if self._mental_model_refresh_llm_timeout_only and not refresh_timeout_widened:
             # None, not an alias to the reflect config: callers reassign
             # ``_reflect_llm_config`` after __init__ (tests swapping in a real
             # provider, most of all), and an alias captured here would keep
@@ -4155,7 +4172,24 @@ class MemoryEngine(MemoryEngineInterface):
         retry-exhausted alike). The poller calls this afterwards, from outside the
         cancelled task, so a timed-out consolidation still reaches subscribers instead
         of going silent. Best-effort: ``_fire_consolidation_webhook`` logs and swallows.
+
+        A timed-out mental-model refresh is recorded like any other failed refresh,
+        for the same reason: its ``except`` blocks never ran, and without the record
+        the automatic triggers would queue it again on the next tick (#4532).
         """
+        if task_dict.get("type") == "refresh_mental_model":
+            token = _current_schema.set(schema)
+            try:
+                await self._record_mental_model_refresh_failure(
+                    task_dict.get("bank_id", ""),
+                    task_dict.get("mental_model_id", ""),
+                    outcome="refresh_failed_error",
+                    failure_reason="unexpected_error",
+                    error_message=error_message,
+                )
+            finally:
+                _current_schema.reset(token)
+            return
         if task_dict.get("type") != "consolidation":
             return
         operation_id = task_dict.get("operation_id")
@@ -14985,9 +15019,16 @@ class MemoryEngine(MemoryEngineInterface):
         Resolved per access rather than stored: with no
         MENTAL_MODEL_REFRESH_LLM_* override this *is* whatever
         ``_reflect_llm_config`` currently holds, including a provider swapped in
-        after __init__ (issue #4463).
+        after __init__ (issue #4463). The same holds when the override exists only
+        to give refresh a longer timeout: a swapped-in reflect provider wins.
         """
-        return self._mental_model_refresh_llm_override or self._reflect_llm_config
+        override = self._mental_model_refresh_llm_override
+        if override is None or (
+            self._mental_model_refresh_llm_timeout_only
+            and self._reflect_llm_config is not self._reflect_llm_config_at_init
+        ):
+            return self._reflect_llm_config
+        return override
 
     def _llm_for_reflect_operation(self, operation_label: str) -> "LLMConfig | MultiLLMProvider":
         """Pick the LLM for a reflect-pipeline run: interactive, or background refresh.
@@ -17756,6 +17797,7 @@ class MemoryEngine(MemoryEngineInterface):
                         system_prompt=STRUCTURED_DELTA_SYSTEM_PROMPT,
                         user_prompt=user_prompt,
                         scope="mental_model_delta_ops",
+                        document=current_doc,
                         response_format=DeltaOperationList,
                         strict_schema=get_config().llm_strict_schema_reflect,
                         skip_validation=True,  # Get raw JSON; the parser validates op-by-op
@@ -18110,7 +18152,10 @@ class MemoryEngine(MemoryEngineInterface):
                     bank_id,
                     mental_model_id,
                     reflect_response=reflect_response_payload,
-                    last_refreshed_source_query=run.source_query,
+                    # No last_refreshed_source_query either: it decides full vs delta,
+                    # and stamping the query of a run that wrote nothing makes the
+                    # retry after a failed full refresh (source_query changed) run as
+                    # a delta against the old query's document (#4579).
                     request_context=request_context,
                 )
                 # ``refresh_skipped`` above is only readable until the next refresh
@@ -18145,7 +18190,8 @@ class MemoryEngine(MemoryEngineInterface):
                     outcome="refresh_failed_delta_not_applied",
                     detail=(
                         "delta operations did not reach the document, and the reflect candidate covers only "
-                        "memories newer than the last refresh, so writing it would drop the rest of the document."
+                        "memories newer than the last refresh, so writing it would drop the rest of the document. "
+                        "If this keeps happening, set the model's refresh mode to full."
                     ),
                 )
 
@@ -18679,17 +18725,33 @@ class MemoryEngine(MemoryEngineInterface):
         failure_reason: "RefreshFailureReason",
         error_message: str,
     ) -> None:
-        """Record a refusal to write in the model's own history.
+        """Record a refusal to write: stamp the model, and add a row to its history.
 
         A failed refresh writes no content, so before this it left no trace on the
         model at all: the History tab kept rendering the last SUCCESSFUL trace as
         though it were current, and the only record of the failure was prose on an
         async-operation row that a mental-model view never reads (#2894).
 
+        ``last_refresh_failed_at`` is what stops the automatic triggers: the failure
+        leaves ``last_refreshed_at`` behind, so the model still looks stale and the
+        scheduler used to queue the same doomed refresh every tick, paying the LLM
+        each time (#4532). See ``_automatic_refresh_paused``.
+
         Best-effort by design — the refresh has already failed and is about to
-        raise; losing the audit row must not also swallow that exception, and the
+        raise; losing either write must not also swallow that exception, and the
         operation still carries the same reason in its typed ``details``.
         """
+        try:
+            backend = await self._get_backend()
+            async with acquire_with_retry(backend) as conn:
+                await conn.execute(
+                    f"UPDATE {fq_table('mental_models')} SET last_refresh_failed_at = now() "
+                    "WHERE bank_id = $1 AND id = $2",
+                    bank_id,
+                    mental_model_id,
+                )
+        except Exception as e:
+            logger.warning(f"Failed to stamp refresh failure on mental model {mental_model_id}: {e}")
         config = get_config()
         if not config.enable_mental_model_history:
             return
@@ -22636,11 +22698,15 @@ class MemoryEngine(MemoryEngineInterface):
         Returns:
             Dict with operation_id — the surviving operation's when this submit was
             suppressed, together with ``deduplicated=True``, so the caller can poll
-            that one to completion either way.
+            that one to completion either way. An automatic submit for a model whose
+            last refresh failed queues nothing and returns ``{"paused": True}``.
         """
         self._raise_if_mental_model_refresh_unavailable()
 
         await self._authenticate_tenant(request_context)
+
+        if automatic and await self._automatic_refresh_paused(bank_id, mental_model_id):
+            return {"paused": True}
 
         # Pre-operation validation (credit check)
         if self._operation_validator:
@@ -22694,6 +22760,27 @@ class MemoryEngine(MemoryEngineInterface):
             await self._clear_refresh_park(submitted["operation_id"], bank_id)
 
         return submitted
+
+    async def _automatic_refresh_paused(self, bank_id: str, mental_model_id: str) -> bool:
+        """True when the model's last refresh failed, so automatic triggers must skip it.
+
+        A failed refresh already had its worker retries. Re-queuing it on the next
+        scheduler tick or consolidation round sends the same prompt to the same model
+        and fails the same way, forever, on the caller's LLM bill (#4532). It stays
+        paused until a refresh succeeds, which only an explicit one can do now: that
+        moves ``last_refreshed_at`` past ``last_refresh_failed_at``.
+        """
+        backend = await self._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            row = await conn.fetchrow(
+                f"SELECT last_refresh_failed_at, last_refreshed_at FROM {fq_table('mental_models')} "
+                "WHERE bank_id = $1 AND id = $2",
+                bank_id,
+                mental_model_id,
+            )
+        if row is None or row["last_refresh_failed_at"] is None:
+            return False
+        return row["last_refreshed_at"] is None or row["last_refresh_failed_at"] > row["last_refreshed_at"]
 
     async def _clear_refresh_park(self, operation_id: str, bank_id: str) -> None:
         """Make a queued refresh claimable now, and no longer min-interval eligible.

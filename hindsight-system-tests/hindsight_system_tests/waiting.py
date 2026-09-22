@@ -35,12 +35,14 @@ async def wait_until_settled(
     bank_id: str,
     *,
     timeout: float = SETTLE_TIMEOUT_SECONDS,
+    allow_failed: bool = False,
 ) -> None:
     """Block until the bank's background work has finished.
 
     Raises on a failed operation, and on timeout reports what was still in flight
     — a bare "timed out" would send the reader to the server log for something the
-    API could have told them.
+    API could have told them. ``allow_failed`` is for a story whose subject *is*
+    a failure: it asserts the failed operations itself.
     """
     deadline = time.monotonic() + timeout
     quiet_polls = 0
@@ -48,7 +50,7 @@ async def wait_until_settled(
 
     while time.monotonic() < deadline:
         failed = await client.operations.list_operations(bank_id, status="failed", limit=100)
-        if failed.operations:
+        if failed.operations and not allow_failed:
             summary = ", ".join(
                 f"{op.task_type}: {op.error_message or 'no error recorded'}" for op in failed.operations
             )
