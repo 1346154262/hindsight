@@ -9190,16 +9190,16 @@ class MemoryEngine(MemoryEngineInterface):
                     if reranker_max_candidates is not None
                     else get_config().reranker_max_candidates
                 )
-                if len(merged_candidates) > max_candidates:
-                    # Sort by RRF score (boosted per-strategy if configured) and take top
-                    # candidates. The rank-space boost reaches deeper into a boosted arm
-                    # before the cut without displacing the head of the other arms (#3956).
-                    from .search.recall_boost import boosted_rrf_score
+                # Sort by RRF score (boosted per-strategy if configured) and take top
+                # candidates only when the pool exceeds the cap. Under the cap the boost
+                # does not run and rrf_score is left as fusion wrote it (#3956, #4008).
+                from .search.recall_boost import trim_merged_candidates
 
-                    strategy_boosts = get_config().recall_strategy_boosts
-                    merged_candidates.sort(key=lambda mc: boosted_rrf_score(mc, strategy_boosts), reverse=True)
-                    pre_filtered_count = len(merged_candidates) - max_candidates
-                    merged_candidates = merged_candidates[:max_candidates]
+                strategy_boosts = get_config().recall_strategy_boosts
+                merged_candidates, pre_filtered_count = trim_merged_candidates(
+                    merged_candidates, max_candidates, strategy_boosts
+                )
+                if pre_filtered_count > 0:
                     # Surface the cut in the trace: which arms actually made it into
                     # the reranker's budget, and whether a boost shaped that. Ranking
                     # complaints land on the trace first, and without this the boost
@@ -9305,8 +9305,12 @@ class MemoryEngine(MemoryEngineInterface):
                 log_buffer.append("  [4.6] Interleave order preserved (combined scoring skipped)")
             elif scored_results:
                 ce = reranker_instance.cross_encoder
-                # "rrf" mode is passthrough by construction; so is a configured "rrf" CE.
-                is_passthrough = (reranking == "rrf") or (ce is not None and ce.provider_name == "rrf")
+                # "rrf" mode is passthrough by construction; so is a configured "rrf"
+                # CE, including a failover chain that has degraded to its rrf member.
+                from .search.recall_boost import stage2_passthrough
+
+                provider_name = ce.provider_name if ce is not None else None
+                is_passthrough = stage2_passthrough(reranking, provider_name)
                 scoring_config = get_config()
                 apply_combined_scoring(
                     scored_results,
@@ -9316,18 +9320,25 @@ class MemoryEngine(MemoryEngineInterface):
                     recency_decay_linear_window_days=scoring_config.recency_decay_linear_window_days,
                     recency_decay_halflife_days=scoring_config.recency_decay_halflife_days,
                 )
-                # Per-strategy additive boost: nudge candidates surfaced by a
-                # prioritised retrieval arm up the final ordering.
+                # Per-strategy bump after combined scoring. Passthrough recalls
+                # (explicit rrf, an rrf provider, or a chain that failed over to
+                # rrf) skip the add: there is no cross-encoder score to correct,
+                # and a flat add on the RRF-seeded weight reorders the list (#4008).
                 strategy_boosts = get_config().recall_strategy_boosts
+                stage2: str | None = None
                 if strategy_boosts:
-                    from .search.recall_boost import additive_strategy_boost
+                    from .search.recall_boost import apply_stage2_from_reranker
 
-                    for sr in scored_results:
-                        sr.weight += additive_strategy_boost(sr.candidate.source_ranks, strategy_boosts)
+                    stage2 = apply_stage2_from_reranker(
+                        scored_results,
+                        strategy_boosts,
+                        reranking=reranking,
+                        provider_name=provider_name,
+                    )
                 scored_results.sort(key=lambda x: x.weight, reverse=True)
                 log_buffer.append("  [4.6] Combined scoring: ce * recency_boost(0.2) * temporal_boost(0.2)")
                 if strategy_boosts:
-                    log_buffer.append(f"  [4.7] Strategy boosts applied: {strategy_boosts}")
+                    log_buffer.append(f"  [4.7] Strategy boosts applied: {strategy_boosts} {stage2}")
 
             # Step 4.9: post-query min_scores filters (reranker + final). The
             # semantic/text floors are applied earlier inside the SQL arms (see
