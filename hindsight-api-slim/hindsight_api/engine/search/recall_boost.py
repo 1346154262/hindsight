@@ -167,11 +167,19 @@ def additive_strategy_boost(source_ranks: dict[str, int], boosts: dict[str, str]
     return total
 
 
+@dataclass(frozen=True)
+class TrimmedCandidates:
+    """Who survived the pre-rerank cap, and how many were dropped."""
+
+    kept: list[MergedCandidate]
+    dropped: int
+
+
 def trim_merged_candidates(
     candidates: list[MergedCandidate],
     max_candidates: int,
     boosts: dict[str, str],
-) -> tuple[list[MergedCandidate], int]:
+) -> TrimmedCandidates:
     """Keep the pre-rerank budget, promoting boosted arms in rank space.
 
     When the pool does not exceed ``max_candidates`` the same list is returned
@@ -181,10 +189,10 @@ def trim_merged_candidates(
     left as fusion wrote it.
     """
     if len(candidates) <= max_candidates:
-        return candidates, 0
+        return TrimmedCandidates(kept=candidates, dropped=0)
     candidates.sort(key=lambda mc: boosted_rrf_score(mc, boosts), reverse=True)
     dropped = len(candidates) - max_candidates
-    return candidates[:max_candidates], dropped
+    return TrimmedCandidates(kept=candidates[:max_candidates], dropped=dropped)
 
 
 def stage2_passthrough(reranking: str, provider_name: str | None) -> bool:
@@ -227,8 +235,9 @@ def apply_stage2_from_reranker(
 ) -> str | None:
     """Stage 2 as recall invokes it: derive passthrough, then maybe bump.
 
-    ``provider_name`` is ``cross_encoder.provider_name`` (the active failover
-    member when the reranker is a chain), or ``None`` when there is no encoder.
+    ``provider_name`` is the member that produced this request's scores, copied
+    off the rerank call. It is not a later read of a failover chain's shared
+    active member. ``None`` when this recall did not run a cross-encoder.
     """
     return apply_post_rerank_boost(
         scored_results,

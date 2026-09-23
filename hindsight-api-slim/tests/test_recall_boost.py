@@ -1,5 +1,7 @@
 """Tests for per-strategy recall boosting (config parsing + boost math)."""
 
+from dataclasses import dataclass
+
 import pytest
 
 from hindsight_api.config import RECALL_BOOST_LEVELS, _parse_strategy_boosts
@@ -11,7 +13,8 @@ from hindsight_api.engine.search.recall_boost import (
     stage2_passthrough,
     trim_merged_candidates,
 )
-from hindsight_api.engine.search.types import MergedCandidate, RetrievalResult
+from hindsight_api.engine.search.reranking import RerankResult
+from hindsight_api.engine.search.types import MergedCandidate, RetrievalResult, ScoredResult
 
 
 def _candidate(rrf_score: float, source_ranks: dict[str, int], *, id: str = "x") -> MergedCandidate:
@@ -345,20 +348,26 @@ def test_rank_decay_can_fall_below_min_final():
     assert not (sr.weight >= min_final)
 
 
-def _passthrough_finish(pool: list[MergedCandidate], cap: int, boosts: dict[str, str]):
+@dataclass
+class _PassthroughFinish:
+    scored: list[ScoredResult]
+    token: str | None
+
+
+def _passthrough_finish(pool: list[MergedCandidate], cap: int, boosts: dict[str, str]) -> _PassthroughFinish:
     """The rrf-mode tail of recall: trim, order by raw rrf, combined scoring, stage 2."""
     from datetime import UTC, datetime
 
     from hindsight_api.engine.search.reranking import apply_combined_scoring
     from hindsight_api.engine.search.types import ScoredResult
 
-    kept, _dropped = trim_merged_candidates(list(pool), cap, boosts)
-    ordered = sorted(kept, key=lambda mc: mc.rrf_score, reverse=True)
+    trimmed = trim_merged_candidates(list(pool), cap, boosts)
+    ordered = sorted(trimmed.kept, key=lambda mc: mc.rrf_score, reverse=True)
     scored = [ScoredResult(candidate=mc, weight=0.0) for mc in ordered]
     apply_combined_scoring(scored, now=datetime(2026, 1, 1, tzinfo=UTC), is_passthrough_reranker=True)
     token = apply_stage2_from_reranker(scored, boosts, reranking="rrf", provider_name="local")
     scored.sort(key=lambda sr: sr.weight, reverse=True)
-    return scored, token
+    return _PassthroughFinish(scored=scored, token=token)
 
 
 def _pool() -> list[MergedCandidate]:
@@ -374,24 +383,24 @@ def _pool() -> list[MergedCandidate]:
 
 def test_passthrough_under_cap_matches_no_boost():
     """Pool within the cap: stage 1 does not run, stage 2 is skipped, so the boost is a no-op."""
-    boosted, token = _passthrough_finish(_pool(), cap=10, boosts={"graph": "high"})
-    plain, plain_token = _passthrough_finish(_pool(), cap=10, boosts={})
-    assert token == "stage2=skipped_passthrough"
-    assert plain_token is None
-    assert [sr.id for sr in boosted] == [sr.id for sr in plain]
-    assert [sr.weight for sr in boosted] == pytest.approx([sr.weight for sr in plain])
+    boosted = _passthrough_finish(_pool(), cap=10, boosts={"graph": "high"})
+    plain = _passthrough_finish(_pool(), cap=10, boosts={})
+    assert boosted.token == "stage2=skipped_passthrough"
+    assert plain.token is None
+    assert [sr.id for sr in boosted.scored] == [sr.id for sr in plain.scored]
+    assert [sr.weight for sr in boosted.scored] == pytest.approx([sr.weight for sr in plain.scored])
 
 
 def test_passthrough_over_cap_changes_membership_not_rrf_order():
     """Over the cap the boost only chooses who enters. Order stays raw RRF, with no stage-2 add."""
-    boosted, token = _passthrough_finish(_pool(), cap=2, boosts={"graph": "high"})
-    plain, _token = _passthrough_finish(_pool(), cap=2, boosts={})
-    assert token == "stage2=skipped_passthrough"
-    assert {sr.id for sr in boosted} == {"g3", "sem1"}
-    assert {sr.id for sr in plain} == {"sem1", "sem2"}
+    boosted = _passthrough_finish(_pool(), cap=2, boosts={"graph": "high"})
+    plain = _passthrough_finish(_pool(), cap=2, boosts={})
+    assert boosted.token == "stage2=skipped_passthrough"
+    assert {sr.id for sr in boosted.scored} == {"g3", "sem1"}
+    assert {sr.id for sr in plain.scored} == {"sem1", "sem2"}
     # Raw RRF puts sem1 ahead of g3. The boosted rank-space score would not.
-    assert [sr.id for sr in boosted] == ["sem1", "g3"]
-    graph = next(sr for sr in boosted if sr.id == "g3")
+    assert [sr.id for sr in boosted.scored] == ["sem1", "g3"]
+    graph = next(sr for sr in boosted.scored if sr.id == "g3")
     assert graph.weight == pytest.approx(graph.combined_score)
     assert graph.weight == pytest.approx(0.1)
     assert graph.weight + BOOST_LEVELS["high"].additive != pytest.approx(graph.weight)
@@ -434,16 +443,19 @@ def test_recall_async_wires_stage2_and_keeps_interleave(monkeypatch):
         async def ensure_initialized(self) -> None:
             return None
 
-        async def rerank(self, _query: str, candidates: list) -> list[ScoredResult]:
-            return [
-                ScoredResult(
-                    candidate=candidate,
-                    cross_encoder_score=0.2,
-                    cross_encoder_score_normalized=0.2,
-                    weight=0.2,
-                )
-                for candidate in candidates
-            ]
+        async def rerank(self, _query: str, candidates: list[MergedCandidate]) -> RerankResult:
+            return RerankResult(
+                results=[
+                    ScoredResult(
+                        candidate=candidate,
+                        cross_encoder_score=0.2,
+                        cross_encoder_score_normalized=0.2,
+                        weight=0.2,
+                    )
+                    for candidate in candidates
+                ],
+                provider_name=self.cross_encoder.provider_name,
+            )
 
     class _Config:
         def __init__(self, base: object, boosts: dict[str, str]) -> None:
