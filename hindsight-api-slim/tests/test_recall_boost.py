@@ -6,9 +6,9 @@ import pytest
 
 from hindsight_api.config import RECALL_BOOST_LEVELS, _parse_strategy_boosts
 from hindsight_api.engine.search.recall_boost import (
+    apply_post_rerank_boost,
     BOOST_LEVELS,
     additive_strategy_boost,
-    apply_stage2_from_reranker,
     boosted_rrf_score,
     stage2_passthrough,
     trim_merged_candidates,
@@ -198,7 +198,7 @@ def test_deep_rank_bump_still_beats_a_tiny_absolute_score():
     semantic = [_scored(0.01, {}, suffix=f"s{i}") for i in range(20)]
     graph = [_scored(0.0, {"graph_rank": rank}, suffix=f"g{rank}") for rank in range(1, 301)]
     rows = semantic + graph
-    assert apply_stage2_from_reranker(rows, {"graph": "high"}, reranking="cross_encoder", provider_name="tei") == (
+    assert apply_post_rerank_boost(rows, {"graph": "high"}, passthrough=stage2_passthrough("cross_encoder", "tei")) == (
         "stage2=rank_decay"
     )
     rows.sort(key=lambda sr: sr.weight, reverse=True)
@@ -291,19 +291,21 @@ def test_stage2_passthrough_modes_skip_the_bump():
     assert stage2_passthrough("cross_encoder", "tei") is False
     assert stage2_passthrough("cross_encoder", None) is False
 
-    skipped = apply_stage2_from_reranker([row], {"graph": "high"}, reranking="rrf", provider_name="tei")
+    skipped = apply_post_rerank_boost([row], {"graph": "high"}, passthrough=stage2_passthrough("rrf", "tei"))
     assert skipped == "stage2=skipped_passthrough"
     assert row.weight == pytest.approx(0.2)
 
     configured = _scored(0.2, {"graph_rank": 1}, suffix="configured")
-    token = apply_stage2_from_reranker([configured], {"graph": "high"}, reranking="cross_encoder", provider_name="rrf")
+    token = apply_post_rerank_boost(
+        [configured], {"graph": "high"}, passthrough=stage2_passthrough("cross_encoder", "rrf")
+    )
     assert token == "stage2=skipped_passthrough"
     assert configured.weight == pytest.approx(0.2)
 
     live = _scored(0.2, {"graph_rank": 1}, suffix="live")
-    assert apply_stage2_from_reranker([live], {"graph": "high"}, reranking="cross_encoder", provider_name="tei") == (
-        "stage2=rank_decay"
-    )
+    assert apply_post_rerank_boost(
+        [live], {"graph": "high"}, passthrough=stage2_passthrough("cross_encoder", "tei")
+    ) == ("stage2=rank_decay")
     assert live.weight == pytest.approx(0.2 + BOOST_LEVELS["high"].additive)
 
 
@@ -327,8 +329,8 @@ def test_failover_to_rrf_is_passthrough():
     chain._active = 1
     assert chain.provider_name == "rrf"
     row = _scored(0.2, {"graph_rank": 1}, suffix="failed-over")
-    token = apply_stage2_from_reranker(
-        [row], {"graph": "high"}, reranking="cross_encoder", provider_name=chain.provider_name
+    token = apply_post_rerank_boost(
+        [row], {"graph": "high"}, passthrough=stage2_passthrough("cross_encoder", chain.provider_name)
     )
     assert token == "stage2=skipped_passthrough"
     assert row.weight == pytest.approx(0.2)
@@ -341,7 +343,7 @@ def test_rank_decay_can_fall_below_min_final():
     ``sr.weight >= min_final`` in ``MemoryEngine.recall_async``.
     """
     sr = _scored(0.04, {"graph_rank": 200})
-    apply_stage2_from_reranker([sr], {"graph": "high"}, reranking="cross_encoder", provider_name="tei")
+    apply_post_rerank_boost([sr], {"graph": "high"}, passthrough=stage2_passthrough("cross_encoder", "tei"))
     min_final = 0.5
     assert 0.04 + BOOST_LEVELS["high"].additive >= min_final
     assert sr.weight < min_final
@@ -365,7 +367,7 @@ def _passthrough_finish(pool: list[MergedCandidate], cap: int, boosts: dict[str,
     ordered = sorted(trimmed.kept, key=lambda mc: mc.rrf_score, reverse=True)
     scored = [ScoredResult(candidate=mc, weight=0.0) for mc in ordered]
     apply_combined_scoring(scored, now=datetime(2026, 1, 1, tzinfo=UTC), is_passthrough_reranker=True)
-    token = apply_stage2_from_reranker(scored, boosts, reranking="rrf", provider_name="local")
+    token = apply_post_rerank_boost(scored, boosts, passthrough=stage2_passthrough("rrf", "local"))
     scored.sort(key=lambda sr: sr.weight, reverse=True)
     return _PassthroughFinish(scored=scored, token=token)
 
@@ -408,7 +410,7 @@ def test_passthrough_over_cap_changes_membership_not_rrf_order():
 
 def test_empty_boosts_leave_stage2_unlogged():
     row = _scored(0.4, {"graph_rank": 1})
-    assert apply_stage2_from_reranker([row], {}, reranking="cross_encoder", provider_name="tei") is None
+    assert apply_post_rerank_boost([row], {}, passthrough=stage2_passthrough("cross_encoder", "tei")) is None
     assert row.weight == pytest.approx(0.4)
 
 

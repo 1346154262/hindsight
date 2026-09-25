@@ -51,7 +51,7 @@ several arms have been summed. Displacement no longer depends on the pool size.
 
 from dataclasses import dataclass
 
-from .types import MergedCandidate
+from .types import MergedCandidate, ScoredResult
 
 
 @dataclass(frozen=True)
@@ -200,14 +200,14 @@ def stage2_passthrough(reranking: str, provider_name: str | None) -> bool:
 
     Explicit ``reranking="rrf"`` keeps fusion order. A cross-encoder whose
     ``provider_name`` is ``"rrf"`` is the same path, including a failover chain
-    that has degraded to its ``rrf`` member: that chain reports the active
-    member's name.
+    whose ``rrf`` member served this request. ``provider_name`` must be the one
+    captured on the rerank result, not a later read of the chain's shared cursor.
     """
     return reranking == "rrf" or provider_name == "rrf"
 
 
 def apply_post_rerank_boost(
-    scored_results: list,
+    scored_results: list[ScoredResult],
     boosts: dict[str, str],
     *,
     passthrough: bool,
@@ -224,23 +224,3 @@ def apply_post_rerank_boost(
     for sr in scored_results:
         sr.weight += additive_strategy_boost(sr.candidate.source_ranks, boosts)
     return "stage2=rank_decay"
-
-
-def apply_stage2_from_reranker(
-    scored_results: list,
-    boosts: dict[str, str],
-    *,
-    reranking: str,
-    provider_name: str | None,
-) -> str | None:
-    """Stage 2 as recall invokes it: derive passthrough, then maybe bump.
-
-    ``provider_name`` is the member that produced this request's scores, copied
-    off the rerank call. It is not a later read of a failover chain's shared
-    active member. ``None`` when this recall did not run a cross-encoder.
-    """
-    return apply_post_rerank_boost(
-        scored_results,
-        boosts,
-        passthrough=stage2_passthrough(reranking, provider_name),
-    )

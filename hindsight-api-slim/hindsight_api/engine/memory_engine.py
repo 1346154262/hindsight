@@ -9334,14 +9334,9 @@ class MemoryEngine(MemoryEngineInterface):
                 strategy_boosts = get_config().recall_strategy_boosts
                 stage2: str | None = None
                 if strategy_boosts:
-                    from .search.recall_boost import apply_stage2_from_reranker
+                    from .search.recall_boost import apply_post_rerank_boost
 
-                    stage2 = apply_stage2_from_reranker(
-                        scored_results,
-                        strategy_boosts,
-                        reranking=reranking,
-                        provider_name=served_provider,
-                    )
+                    stage2 = apply_post_rerank_boost(scored_results, strategy_boosts, passthrough=is_passthrough)
                 scored_results.sort(key=lambda x: x.weight, reverse=True)
                 log_buffer.append("  [4.6] Combined scoring: ce * recency_boost(0.2) * temporal_boost(0.2)")
                 if strategy_boosts:
