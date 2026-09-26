@@ -516,9 +516,7 @@ async def test_store_owned_update_normalizes_str_and_uuid_before_dedupe():
 
 @pytest.mark.asyncio
 @pytest.mark.memory_backend_incompatible
-async def test_consolidation_job_create_with_repeated_source_ids_persists_unique(
-    memory: MemoryEngine, request_context
-):
+async def test_consolidation_job_create_with_repeated_source_ids_persists_unique(memory: MemoryEngine, request_context):
     """Mock LLM CREATE with duplicate source_fact_ids; job persists unique IDs + matching proof_count."""
     bank_id = f"test-src-dedupe-job-create-{uuid.uuid4().hex[:8]}"
     await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
