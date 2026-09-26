@@ -508,15 +508,19 @@ async def test_store_owned_update_normalizes_str_and_uuid_before_dedupe():
 
 
 # ---------------------------------------------------------------------------
-# Stub system story: LLM returns repeated source_fact_ids; next prompt is clean
+# api-slim integration: run_consolidation_job CREATE with repeated source IDs
+# (NOT a hindsight-system-tests story; dirty-row serializer coverage is the
+# TestBuildObservationsForLlmSourceDedupe unit class above.)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 @pytest.mark.memory_backend_incompatible
-async def test_system_story_llm_repeated_source_ids_do_not_inflate_next_prompt(memory: MemoryEngine, request_context):
-    """LLM emits duplicate source_fact_ids; after persist, list + next serialize agree."""
-    bank_id = f"test-src-dedupe-story-{uuid.uuid4().hex[:8]}"
+async def test_consolidation_job_create_with_repeated_source_ids_persists_unique(
+    memory: MemoryEngine, request_context
+):
+    """Mock LLM CREATE with duplicate source_fact_ids; job persists unique IDs + matching proof_count."""
+    bank_id = f"test-src-dedupe-job-create-{uuid.uuid4().hex[:8]}"
     await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
     try:
         fact_ids = await _retain_facts(
@@ -530,33 +534,22 @@ async def test_system_story_llm_repeated_source_ids_do_not_inflate_next_prompt(m
         )
         assert len(fact_ids) >= 2
         a, b = str(fact_ids[0]), str(fact_ids[1])
-
-        serialized_prompts: list[list[dict]] = []
+        # LLM emits repeats; raw length must exceed unique so we document write-path intent.
+        llm_emitted_source_ids = [a, a, b, a, b, a]
+        unique_source_ids = [a, b]
+        assert len(llm_emitted_source_ids) > len(unique_source_ids)
 
         def callback(messages, scope):
             if scope != "consolidation":
                 return _ConsolidationBatchResponse()
-            prompt = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
-            # Capture EXISTING OBSERVATIONS block when present (second round).
-            if "EXISTING OBSERVATIONS" in prompt or '"source_memories"' in prompt:
-                # The serializer output is JSON-dumped into the prompt; capture via hook below.
-                pass
-            # Always emit a CREATE that repeats source ids many times.
             return _ConsolidationBatchResponse(
                 creates=[
                     _CreateAction(
                         text="Julia and Kevin teach STEM subjects.",
-                        source_fact_ids=[a, a, b, a, b, a],
+                        source_fact_ids=llm_emitted_source_ids,
                     )
                 ]
             )
-
-        original_build = C._build_observations_for_llm
-
-        def capturing_build(observations, source_facts):
-            out = original_build(observations, source_facts)
-            serialized_prompts.append(out)
-            return out
 
         original_llm = memory._consolidation_llm_config
         memory._consolidation_llm_config = _llm(callback)
@@ -564,56 +557,16 @@ async def test_system_story_llm_repeated_source_ids_do_not_inflate_next_prompt(m
             with (
                 _override_config(memory, consolidation_llm_batch_size=8, consolidation_llm_parallelism=1),
                 patch.object(memory, "submit_async_consolidation"),
-                patch.object(C, "_build_observations_for_llm", side_effect=capturing_build),
             ):
                 await run_consolidation_job(memory_engine=memory, bank_id=bank_id, request_context=request_context)
 
             observations = await _list_observations(memory, bank_id, request_context)
             assert len(observations) >= 1
             obs = next(o for o in observations if "Julia" in o["text"] or "STEM" in o["text"])
-            assert obs["source_memory_ids"] == [a, b]
-            assert obs["proof_count"] == 2
+            assert obs["source_memory_ids"] == unique_source_ids
+            assert obs["proof_count"] == len(unique_source_ids)
             assert obs["proof_count"] == len(obs["source_memory_ids"])
-
-            # Second consolidation: retain a new fact so a batch runs with the existing obs.
-            await _retain_facts(
-                memory,
-                request_context,
-                bank_id,
-                ["Lena coaches the debate team on Thursdays."],
-            )
-
-            # Change callback to UPDATE the existing observation with more duplicate ids.
-            def callback2(messages, scope):
-                if scope != "consolidation":
-                    return _ConsolidationBatchResponse()
-                return _ConsolidationBatchResponse(
-                    updates=[
-                        _UpdateAction(
-                            text="Julia, Kevin, and Lena teach and coach.",
-                            observation_id=obs["id"],
-                            source_fact_ids=[a, b, a, b],
-                        )
-                    ]
-                )
-
-            memory._consolidation_llm_config = _llm(callback2)
-            serialized_prompts.clear()
-            with (
-                _override_config(memory, consolidation_llm_batch_size=8, consolidation_llm_parallelism=1),
-                patch.object(memory, "submit_async_consolidation"),
-                patch.object(C, "_build_observations_for_llm", side_effect=capturing_build),
-            ):
-                await run_consolidation_job(memory_engine=memory, bank_id=bank_id, request_context=request_context)
-
-            # The observation fed into the second round must not expand by repeat count.
-            assert serialized_prompts, "second consolidation must serialize existing observations"
-            for payload in serialized_prompts:
-                for entry in payload:
-                    if entry["id"] == obs["id"]:
-                        assert entry["proof_count"] == 2
-                        src = entry.get("source_memories") or []
-                        assert len(src) <= 2, f"next consolidation must not expand by repeat count; got {len(src)}"
+            assert len(llm_emitted_source_ids) > len(obs["source_memory_ids"])
         finally:
             memory._consolidation_llm_config = original_llm
     finally:
