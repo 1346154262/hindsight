@@ -742,6 +742,11 @@ def _unique_source_memory_ids(ids: list[Any] | None) -> list[str]:
     return list(dict.fromkeys(str(x) for x in ids))
 
 
+def _source_memory_ids_as_uuids(ids: list[str]) -> list[uuid.UUID]:
+    """Convert normalized source-id strings to UUID for SQL/Oracle array and junction writes."""
+    return [uuid.UUID(sid) for sid in ids]
+
+
 async def _filter_live_source_memories(
     conn: "Connection",
     bank_id: str,
@@ -2922,6 +2927,8 @@ async def _apply_update_action(
     # Old recalled IDs are str; live filter returns uuid.UUID. Normalize to str
     # before dedupe so the same ID collapses, keeping old-then-new order (#4799).
     source_ids = _unique_source_memory_ids(list(model.source_fact_ids or []) + list(live_ids))
+    # FactRecord / proof_count keep strings; PG UUID[] and Oracle junction need uuid.UUID.
+    source_ids_uuid = _source_memory_ids_as_uuids(source_ids)
 
     # SECURITY: Merge source fact's tags into existing observation tags so all contributors can see it
     existing_tags = set(model.tags or [])
@@ -2956,7 +2963,7 @@ async def _apply_update_action(
             """,
             new_text,
             embedding_str,
-            source_ids,
+            source_ids_uuid,
             len(source_ids) or 1,
             uuid.UUID(observation_id),
             source_bounds.event_date,
@@ -3031,14 +3038,14 @@ async def _apply_update_action(
             f"DELETE FROM {fq_table('observation_sources')} WHERE observation_id = $1",
             obs_uuid,
         )
-        if source_ids:
+        if source_ids_uuid:
             await conn.executemany(
                 f"""
                 INSERT INTO {fq_table("observation_sources")} (observation_id, source_id)
                 VALUES ($1, $2)
                 ON CONFLICT (observation_id, source_id) DO NOTHING
                 """,
-                [(obs_uuid, sid) for sid in dict.fromkeys(source_ids)],
+                [(obs_uuid, sid) for sid in source_ids_uuid],
             )
 
     if perf:
@@ -3594,6 +3601,8 @@ async def _apply_create_observation(
     # stored array match the unique supporting set (#4799).
     unique_source_ids = _unique_source_memory_ids(live_source_memory_ids)
     proof_count = len(unique_source_ids) or 1
+    # FactRecord / proof_count keep strings; PG UUID[] and Oracle junction need uuid.UUID.
+    unique_source_ids_uuid = _source_memory_ids_as_uuids(unique_source_ids)
 
     t0 = time.time()
     if not store.store_owned_for(bank_id):
@@ -3643,7 +3652,7 @@ async def _apply_create_observation(
             bank_id,
             observation_text,
             embedding_str,
-            unique_source_ids,
+            unique_source_ids_uuid,
             obs_tags,
             obs_event_date,
             obs_occurred_start,
@@ -3654,14 +3663,14 @@ async def _apply_create_observation(
         created_id = row["id"]
 
         # Populate observation_sources junction table (Oracle only — PG uses native array ops).
-        if memory_engine._backend.ops.uses_observation_sources_table and unique_source_ids:
+        if memory_engine._backend.ops.uses_observation_sources_table and unique_source_ids_uuid:
             await conn.executemany(
                 f"""
                 INSERT INTO {fq_table("observation_sources")} (observation_id, source_id)
                 VALUES ($1, $2)
                 ON CONFLICT (observation_id, source_id) DO NOTHING
                 """,
-                [(observation_id, sid) for sid in dict.fromkeys(unique_source_ids)],
+                [(observation_id, sid) for sid in unique_source_ids_uuid],
             )
     else:
         await store.upsert_observation(

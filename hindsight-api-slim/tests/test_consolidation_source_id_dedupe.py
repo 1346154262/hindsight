@@ -20,6 +20,8 @@ from hindsight_api.engine.consolidation.consolidator import (
     _build_observations_for_llm,
     _ConsolidationBatchResponse,
     _CreateAction,
+    _source_memory_ids_as_uuids,
+    _unique_source_memory_ids,
     _UpdateAction,
     run_consolidation_job,
 )
@@ -162,6 +164,27 @@ class TestBuildObservationsForLlmSourceDedupe:
         assert dirty_out == unique_out
         # Structure/content identity — not merely a shorter character count.
         assert json.dumps(dirty_out) == json.dumps(unique_out)
+
+
+# ---------------------------------------------------------------------------
+# Helper unit tests: string dedupe + UUID conversion for SQL binds
+# ---------------------------------------------------------------------------
+
+
+class TestSourceMemoryIdHelpers:
+    def test_unique_preserves_order_and_collapses_str_uuid(self):
+        a, b = uuid.uuid4(), uuid.uuid4()
+        assert _unique_source_memory_ids([a, str(a), b, str(b), a]) == [str(a), str(b)]
+
+    def test_as_uuids_converts_normalized_strings(self):
+        a, b = uuid.uuid4(), uuid.uuid4()
+        ids = _unique_source_memory_ids([a, a, b])
+        converted = _source_memory_ids_as_uuids(ids)
+        assert converted == [a, b]
+        assert all(isinstance(x, uuid.UUID) for x in converted)
+
+    def test_as_uuids_empty(self):
+        assert _source_memory_ids_as_uuids([]) == []
 
 
 # ---------------------------------------------------------------------------
