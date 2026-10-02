@@ -42,12 +42,7 @@ export interface KnowledgeNode {
  * retain API). The scalar modes are the server's; a `string[][]` declares the scopes explicitly.
  */
 export type ObservationScopes =
-  | "shared"
-  | "combined"
-  | "per_tag"
-  | "all_combinations"
-  | "per_source"
-  | string[][];
+  "shared" | "combined" | "per_tag" | "all_combinations" | "per_source" | string[][];
 
 /**
  * `per_source` is resolved HERE, per document, and never reaches the server: it expands to the
@@ -285,6 +280,16 @@ const RETRY_AFTER_CEILING_MS = 60 * 1000;
  *  doubled per attempt up to RETRY_AFTER_CEILING_MS. Jittered, so a pool of workers that all got
  *  the 429 together does not come back together. */
 const RATE_LIMIT_BACKOFF_MS = 1000;
+
+/**
+ * Consecutive HTTP 5xx polls of one operation before drain counts it failed (#5080).
+ *
+ * One 5xx is a blip and stays pending — the next cycle often succeeds, and the streak resets on
+ * any 2xx. A run of them will not clear inside the 60-minute budget, and holding the id pending
+ * logged a dead op as "still pending", the same hour-long spin a 403 caused. Three polls is about
+ * 10s at `POLL_CYCLE_MS`.
+ */
+const SERVER_ERROR_POLL_LIMIT = 3;
 
 /**
  * What the agent gets back from reading one page.
@@ -670,13 +675,28 @@ export class HindsightClient {
    * requests — a 200 to a lone GET with 429s under `Promise.all` over every pending op). A 429
    * leaves the op pending and backs the next cycle off by its `Retry-After` (10s floor) instead
    * of hammering the next cycle 5s later.
+   *
+   * A 403 or 404 is not still running: the bank is outside the gateway, or the operation id is
+   * gone, and the next poll will say the same thing. It is removed, counted failed, and the
+   * status is logged on that first response (#5080). Treating `!r.ok` as "try again" spun for
+   * the whole `maxMs` and logged the op as pending. A 5xx gets `SERVER_ERROR_POLL_LIMIT`
+   * consecutive polls (the streak resets on any 2xx), then the same failure. Other 4xx are
+   * unchanged. A thrown fetch has no status, so it keeps retrying until the budget.
    */
   async drain(ids: string[], label: string, maxMs = 60 * 60 * 1000): Promise<void> {
     if (!ids.length) return;
     this.log(`[wait] draining ${ids.length} ${label} operations …`);
     const start = Date.now();
     const pending = new Set(ids);
+    const serverErrorPolls = new Map<string, number>();
     let failed = 0;
+    // Shared by 403/404 and a 5xx streak so both remove the id, count it, and name the status.
+    const failOperation = (id: string, status: number): void => {
+      pending.delete(id);
+      serverErrorPolls.delete(id);
+      failed++;
+      this.log(`  … ${label} op ${id} failed (HTTP ${status})`);
+    };
     while (pending.size && Date.now() - start < maxMs) {
       // Cycle backoff: default 5s; any 429 in the cycle raises it to the longest Retry-After seen
       // (floor 10s) so a rate-limited API gets room to recover before the next poll round.
@@ -691,7 +711,18 @@ export class HindsightClient {
             );
             return; // op stays pending — retried after the backoff
           }
+          if (r.status === 403 || r.status === 404) {
+            failOperation(id, r.status);
+            return;
+          }
+          if (r.status >= 500) {
+            const seen = (serverErrorPolls.get(id) ?? 0) + 1;
+            if (seen >= SERVER_ERROR_POLL_LIMIT) failOperation(id, r.status);
+            else serverErrorPolls.set(id, seen);
+            return;
+          }
           if (!r.ok) return;
+          serverErrorPolls.delete(id);
           const st = (((await r.json()) as { status?: string }).status || "").toLowerCase();
           if (TERMINAL.has(st)) {
             pending.delete(id);

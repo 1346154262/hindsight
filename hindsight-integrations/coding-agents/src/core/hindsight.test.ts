@@ -238,6 +238,108 @@ describe("HindsightClient.drain", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(log).toHaveBeenCalledWith("[wait] test drained — 2 done, 1 failed");
   });
+
+  // #5080: a non-OK poll used to `return` and leave the id pending, so a 403 was polled for the
+  // whole budget (12 times across 60s) and logged as still pending.
+  it.each([403, 404])(
+    "fails a %i on the first poll and counts it failed, instead of leaving it pending (#5080)",
+    async (status) => {
+      vi.useFakeTimers();
+      const log = vi.fn();
+      const client = new HindsightClient({ apiUrl: "http://x", bank: "b", log });
+      const fetchMock = vi.fn(async () => jsonResponse(status, {}));
+      vi.stubGlobal("fetch", fetchMock);
+
+      const p = client.drain(["1"], "test", 60_000);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(60_000);
+      await p;
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(log).toHaveBeenCalledWith(`  … test op 1 failed (HTTP ${status})`);
+      expect(log).toHaveBeenCalledWith("[wait] test drained — 1 done, 1 failed");
+      expect(log.mock.calls.map((c) => c[0]).join("\n")).not.toContain("still pending");
+    }
+  );
+
+  it("fails a repeated 500 after 3 polls instead of holding it pending for the budget (#5080)", async () => {
+    vi.useFakeTimers();
+    const log = vi.fn();
+    const client = new HindsightClient({ apiUrl: "http://x", bank: "b", log });
+    const fetchMock = vi.fn(async () => jsonResponse(500, {}));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const p = client.drain(["1"], "test", 60_000);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await p;
+
+    expect(fetchMock).toHaveBeenCalledTimes(3); // SERVER_ERROR_POLL_LIMIT, then stop
+    expect(log).toHaveBeenCalledWith("  … test op 1 failed (HTTP 500)");
+    expect(log).toHaveBeenCalledWith("[wait] test drained — 1 done, 1 failed");
+    expect(log.mock.calls.map((c) => c[0]).join("\n")).not.toContain("still pending");
+  });
+
+  it("does not fail a 500 that completes on the next poll, within the 3-poll bound (#5080)", async () => {
+    vi.useFakeTimers();
+    const log = vi.fn();
+    const client = new HindsightClient({ apiUrl: "http://x", bank: "b", log });
+    let polls = 0;
+    const fetchMock = vi.fn(async () => {
+      polls += 1;
+      return polls === 1 ? jsonResponse(500, {}) : jsonResponse(200, { status: "completed" });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const p = client.drain(["1"], "test", 60_000);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await p;
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(log).toHaveBeenCalledWith("[wait] test drained — 1 done, 0 failed");
+    expect(log.mock.calls.map((c) => c[0]).join("\n")).not.toContain("HTTP 500");
+  });
+
+  it("bounds each operation's 5xx streak on its own, so one dead op does not fail its sibling (#5080)", async () => {
+    vi.useFakeTimers();
+    const log = vi.fn();
+    const client = new HindsightClient({ apiUrl: "http://x", bank: "b", log });
+    let bPolls = 0;
+    const fetchMock = vi.fn(async (url: string | URL | Request) => {
+      const id = String(url).split("/").pop();
+      if (id === "b") {
+        bPolls += 1;
+        return bPolls === 1 ? jsonResponse(503, {}) : jsonResponse(200, { status: "completed" });
+      }
+      return jsonResponse(503, {});
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const p = client.drain(["a", "b"], "test", 60_000);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await p;
+
+    expect(fetchMock).toHaveBeenCalledTimes(5); // a,a,a and b,b — b completed on its second poll
+    expect(log).toHaveBeenCalledWith("  … test op a failed (HTTP 503)");
+    expect(log).toHaveBeenCalledWith("[wait] test drained — 2 done, 1 failed");
+    expect(log.mock.calls.map((c) => c[0]).join("\n")).not.toContain("op b failed");
+  });
 });
 
 describe("retryAfterMs", () => {

@@ -47,8 +47,7 @@ export function detectLegacyClaudePlugin(
   const plugins = registry?.plugins;
   if (!plugins || typeof plugins !== "object") return undefined;
   const enabled = readJson(join(claudeDir, "settings.json"))?.enabledPlugins as
-    | Record<string, unknown>
-    | undefined;
+    Record<string, unknown> | undefined;
   for (const [key, raw] of Object.entries(plugins as Record<string, unknown>)) {
     if (key.split("@")[0] !== LEGACY_CLAUDE_PLUGIN) continue;
     if (enabled && enabled[key] === false) continue;

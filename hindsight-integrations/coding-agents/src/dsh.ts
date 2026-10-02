@@ -64,8 +64,7 @@ interface DshUserMessage {
 }
 
 type PreStepDecision =
-  | { kind: "enter"; messages: DshUserMessage[] }
-  | { kind: "reject"; [key: string]: unknown };
+  { kind: "enter"; messages: DshUserMessage[] } | { kind: "reject"; [key: string]: unknown };
 
 interface PreStepPayload {
   agent: DshAgent;
